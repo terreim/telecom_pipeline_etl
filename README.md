@@ -78,9 +78,6 @@ data_pipeline_lab/
 ├── Dockerfile                   # Custom Airflow image
 ├── .env                         # AIRFLOW_UID
 ├── telecom_simulator_v4.py      # Data generator (stream + backfill modes)
-├── telecom_simulator.py         # Legacy simulator
-├── init-scripts/
-│   └── 01-create-airflow-db.sql # Creates airflow DB in shared Postgres
 ├── config/
 │   ├── airflow.cfg
 │   └── clickhouse_config.xml
@@ -102,9 +99,7 @@ data_pipeline_lab/
 │       ├── silver_transformer.py# SilverTransformer — clean, enrich, quarantine
 │       ├── warehouse_loader.py  # ClickHouseLoader — silver → CH staging
 │       └── gold_aggregator.py   # GoldAggregator — CH SQL → gold tables + S3
-├── logs/                        # Airflow task logs (gitignored)
-├── plugins/                     # Airflow plugins (empty)
-└── pip-cache/                   # Shared pip cache for containers
+
 ```
 
 ## Quick Start
