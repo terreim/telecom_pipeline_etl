@@ -1,0 +1,142 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse Custom Configuration
+  
+  This file configures:
+  1. ZooKeeper connection for ReplicatedMergeTree engines
+  2. S3 disk backed by MinIO for tiered storage
+  3. Storage policies for hot/cold data management
+  
+  Mount this file to: /etc/clickhouse-server/config.d/custom_config.xml
+-->
+<clickhouse>
+    <!-- ========================================================================
+         ZooKeeper Configuration
+         Required for: ReplicatedMergeTree, Distributed DDL, ClickHouse Cluster
+         ======================================================================== -->
+    <zookeeper>
+        <node>
+            <host>zookeeper</host>
+            <port>2181</port>
+        </node>
+        <!-- Session timeout in milliseconds -->
+        <session_timeout_ms>30000</session_timeout_ms>
+        <!-- Operation timeout in milliseconds -->
+        <operation_timeout_ms>10000</operation_timeout_ms>
+    </zookeeper>
+
+    <!-- ========================================================================
+         S3 Storage Configuration (MinIO)
+         Enables ClickHouse to use MinIO as external/tiered storage
+         ======================================================================== -->
+    <storage_configuration>
+        <disks>
+            <!-- Local disk (default, fast storage) -->
+            <default>
+                <keep_free_space_bytes>1073741824</keep_free_space_bytes> <!-- 1GB -->
+            </default>
+            
+            <!-- S3 disk backed by MinIO -->
+            <s3_disk>
+                <type>s3</type>
+                <endpoint>http://minio:9000/clickhouse-s3/</endpoint>
+                <access_key_id>minioadmin</access_key_id>
+                <secret_access_key>minioadmin</secret_access_key>
+                <region>us-east-1</region>
+                <!-- Local metadata cache for S3 objects -->
+                <metadata_path>/var/lib/clickhouse/disks/s3_disk/</metadata_path>
+                <!-- Skip SSL verification for local MinIO -->
+                <skip_access_check>false</skip_access_check>
+            </s3_disk>
+        </disks>
+
+        <policies>
+            <!-- Policy: All data on local disk (default behavior) -->
+            <default>
+                <volumes>
+                    <local>
+                        <disk>default</disk>
+                    </local>
+                </volumes>
+            </default>
+
+            <!-- Policy: All data on S3 (cold storage) -->
+            <s3_only>
+                <volumes>
+                    <s3>
+                        <disk>s3_disk</disk>
+                    </s3>
+                </volumes>
+            </s3_only>
+
+            <!-- Policy: Tiered storage (hot local -> cold S3) -->
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                    </hot>
+                    <cold>
+                        <disk>s3_disk</disk>
+                    </cold>
+                </volumes>
+                <!-- Move to cold storage when local disk is 80% full -->
+                <move_factor>0.2</move_factor>
+            </tiered>
+        </policies>
+    </storage_configuration>
+
+    <!-- ========================================================================
+         S3 Table Function Settings
+         Used when querying external S3/MinIO data via s3() table function
+         ======================================================================== -->
+    <s3>
+        <!-- Disable virtual-hosted style URLs (required for MinIO path-style) -->
+        <use_virtual_addressing>false</use_virtual_addressing>
+    </s3>
+
+    <!-- ========================================================================
+         Macros for Replicated Tables
+         Used in ReplicatedMergeTree engine definitions
+         ======================================================================== -->
+    <macros>
+        <cluster>lab_cluster</cluster>
+        <shard>1</shard>
+        <replica>clickhouse_lab</replica>
+        <replica2>clickhouse_lab_2</replica2>
+    </macros>
+
+    <!-- ========================================================================
+         Remote Servers (Cluster Definition)
+         Single-node cluster for local development
+         ======================================================================== -->
+    <remote_servers>
+        <lab_cluster>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>clickhouse</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>admin</password>
+                </replica>
+                <replica2>
+                    <host>clickhouse-replica-2</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>admin</password>
+                </replica2>
+            </shard>
+        </lab_cluster>
+    </remote_servers>
+
+    <!-- ========================================================================
+         Logging Configuration
+         ======================================================================== -->
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>100M</size>
+        <count>3</count>
+    </logger>
+</clickhouse>

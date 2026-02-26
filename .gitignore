@@ -1,0 +1,20 @@
+# Secrets
+.env
+dags/station_dags/.env
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Airflow
+logs/
+plugins/
+
+# Virtualenv & pip cache
+venv/
+pip-cache/
+
+# Old files
+telecom_simulator.py
