@@ -232,6 +232,16 @@ FIRMWARE_BUG_LIFETIME      = (6, 48)              # hours before hotfix deployed
 # ── NEW: Station lifecycle knobs ─────────────────────────────────────────
 NEW_STATION_DAILY_PROB     = 0.02     # Per-day probability a new station is commissioned
 DECOMMISSION_DAILY_PROB    = 0.005    # Per-day probability an old station is retired
+UPGRADE_DAILY_PROB         = 0.008
+
+NEW_STATION_TECH_BY_DENSITY = {
+    "urban_core": {"2G": 0.00, "3G": 0.00, "4G": 0.30, "5G": 0.70},
+    "urban":      {"2G": 0.00, "3G": 0.02, "4G": 0.55, "5G": 0.43},
+    "suburban":   {"2G": 0.00, "3G": 0.05, "4G": 0.80, "5G": 0.15},
+    "rural":      {"2G": 0.00, "3G": 0.10, "4G": 0.88, "5G": 0.02},
+}
+
+UPGRADE_TECH_PATH = {"2G": "4G", "3G": "4G", "4G": "5G"}
 PROVISIONING_HOURS         = (2, 8)               # Time in provisioning state
 TESTING_HOURS              = (4, 24)              # Time in testing state
 
@@ -240,6 +250,58 @@ LATE_ARRIVAL_PROB          = 0.02     # % of records that arrive late
 LATE_ARRIVAL_DELAY         = (60, 900)            # seconds of delay
 NULL_FIELD_PROB            = 0.005    # % of records with a random null field
 DUPLICATE_RECORD_PROB      = 0.003    # % of records that get inserted twice
+
+# ── NEW: UPDATE simulation knobs ────────────────────────────────────────
+# Simulates real-world row corrections that force the ETL to handle changes.
+TRAFFIC_UPDATE_PROB        = 0.015    # % of traffic records corrected (CDR reconciliation)
+TRAFFIC_UPDATE_DELAY       = (30, 600)            # seconds after insert before correction
+EVENT_ENRICHMENT_PROB      = 0.05     # % of events enriched with additional metadata
+EVENT_ENRICHMENT_DELAY     = (60, 1800)           # seconds after insert before enrichment
+METRIC_RECALIBRATION_PROB  = 0.005    # % of metrics recalibrated (sensor drift correction)
+
+# ── Per-station propagation delay (station → client OLTP) ───────────────
+# Consistent per station, determined by density class of location.
+# Urban stations have fiber backhaul, rural have microwave/satellite.
+# This drives the gap: created_at - event_time ≈ created_at gap: {min_d + CLIENT_CLOCK_OFFSET_SECONDS:.1f}s
+# In streaming: event_time = (ETL_NOW + offset) - propagation
+#               created_at = ETL_NOW + offset
+PROPAGATION_DELAY_RANGES = {
+    "dense_urban": (1, 5),      # fiber, fast
+    "urban":       (2, 15),     # mostly fiber
+    "suburban":    (5, 45),     # mixed backhaul
+    "rural":       (20, 180),   # microwave / satellite
+    "highway":     (10, 90),    # microwave relay
+}
+
+# ── Client-to-ETL clock offset ──────────────────────────────────────────
+# The client's clock is AHEAD of the ETL's clock by this many seconds.
+# Client NOW() = ETL NOW() + offset.
+#
+# Time model (streaming):
+#   client_now   = ETL_NOW + CLIENT_CLOCK_OFFSET_SECONDS
+#   created_at   = client_now - etl_client_jitter   (client's wall clock when row is written)
+#   event_time   = client_now - propagation_delay    (station recorded the event earlier)
+#   For late arrivals: event_time -= late_extra       (data was buffered at station)
+#
+# From ETL's perspective: created_at ≈ ETL_NOW + offset (just 60s ahead, always).
+# The propagation delay only affects how far back event_time is, NOT how far
+# ahead created_at is.  ETL buffer only needs to cover offset + margin.
+#
+# Time model (backfill):
+#   event_time   = synthetic past time (known)
+#   created_at   = event_time + propagation + offset  (forward computation)
+#   For late arrivals: created_at += late_extra        (data arrived late at client)
+CLIENT_CLOCK_OFFSET_SECONDS = 60
+
+# ── ETL-to-client network jitter ────────────────────────────────────────
+# Small network delay between ETL server and client server.
+# Makes created_at appear slightly closer to ETL_NOW than the full offset.
+# e.g., offset=60, jitter=3 → created_at ≈ ETL_NOW + 57s
+ETL_CLIENT_JITTER_RANGE = (0, 5)   # seconds
+
+# ── Soft-delete simulation ──────────────────────────────────────────────
+# Operators get acquired, locations get redistricted.
+SOFT_DELETE_DAILY_PROB     = 0.002   # per-entity daily chance of soft delete
 
 # ── Organic events ───────────────────────────────────────────────────────
 ORGANIC_EVENT_WEIGHTS      = [0.30, 0.25, 0.20, 0.10, 0.15]
@@ -416,6 +478,12 @@ class StationRuntime:
     firmware_reboot_end: Optional[datetime] = None
     firmware_bug_end: Optional[datetime] = None
 
+    # Station-to-OLTP reporting delay (seconds).
+    # Consistent per station — urban stations with fiber report fast,
+    # rural stations on microwave links report slow.
+    # This drives the gap between event_time and created_at.
+    propagation_delay_sec: float = 2.0
+
     # Neighbour refs
     neighbors: list = field(default_factory=list)
 
@@ -431,6 +499,13 @@ class StationRuntime:
             StationStatus.DEGRADED,
             StationStatus.TESTING,
         )
+
+    @staticmethod
+    def compute_propagation_delay(density: str, station_code: str) -> float:
+        """Deterministic per-station delay based on density and station identity."""
+        rng = random.Random(f"propdelay-{station_code}")
+        lo, hi = PROPAGATION_DELAY_RANGES.get(density, (2, 30))
+        return round(rng.uniform(lo, hi), 1)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1115,9 +1190,12 @@ class ScenarioEngine:
         if rng.random() > per_sec:
             return None
 
-        location = rng.choice(LOCATIONS)
+        location_weights = self._commissioning_location_weights()
+        location = rng.choices(LOCATIONS, weights=location_weights)[0]
         operator = rng.choices(OPERATORS, weights=OPERATOR_WEIGHTS)[0]
-        technology = rng.choices(TECH_NAMES, weights=TECH_WEIGHTS)[0]
+        density = location.get("density", "urban")
+        tech_profile = NEW_STATION_TECH_BY_DENSITY[density]
+        technology = rng.choices(list(tech_profile.keys()), weights=list(tech_profile.values()))[0]
 
         station_code = f"{operator['code']}-{location['province'][:3].upper()}-{next_station_id:04d}"
         personality = StationPersonality.from_seed(station_code)
@@ -1140,6 +1218,9 @@ class ScenarioEngine:
             personality=personality,
             status=StationStatus.PROVISIONING,
             commissioned_at=now,
+            propagation_delay_sec=StationRuntime.compute_propagation_delay(
+                location.get("density", "urban"), station_code,
+            ),
         )
 
         # Queue lifecycle transitions
@@ -1191,8 +1272,13 @@ class ScenarioEngine:
         ):
             return None
 
-        per_sec = DECOMMISSION_DAILY_PROB / 86400.0
-        if rng.random() > per_sec:
+        district_count = self._district_station_count(station)
+        weight = self._decommission_weight(station, now, district_count)
+        if weight <= 0.0:
+            return None
+        # Scale base probability by relative weight (weight=1.0 is baseline)
+        effective_prob = (DECOMMISSION_DAILY_PROB * weight) / 86400.0
+        if rng.random() > effective_prob:
             return None
 
         station.status = StationStatus.DECOMMISSIONING
@@ -1267,6 +1353,84 @@ class ScenarioEngine:
         self.lifecycle_queue = remaining
         return events
 
+    # ── 9) Station Upgrading ──────────────────────────────────────────────
+
+    def _district_station_count(self, station: StationRuntime) -> int:
+        key = f"{station.location['province']}_{station.location['district']}"
+        return len([
+            s for s in self.cluster_mgr.get_cluster(key)
+            if s.status not in (StationStatus.RETIRED, StationStatus.DECOMMISSIONING)
+        ])
+
+    def _commissioning_location_weights(self) -> list[float]:
+        TARGET_DENSITY_STATIONS = {
+            "urban_core": 6, "urban": 4, "suburban": 2, "rural": 1,
+        }
+        DENSITY_BASE_WEIGHT = {
+            "urban_core": 4.0, "urban": 2.5, "suburban": 1.0, "rural": 0.4,
+        }
+        district_counts: dict[str, int] = {}
+        for s in self.stations:
+            if s.status not in (StationStatus.RETIRED, StationStatus.DECOMMISSIONING):
+                key = f"{s.location['province']}_{s.location['district']}"
+                district_counts[key] = district_counts.get(key, 0) + 1
+
+        weights = []
+        for loc in LOCATIONS:
+            key = f"{loc['province']}_{loc['district']}"
+            density = loc["density"]
+            current = district_counts.get(key, 0)
+            target = TARGET_DENSITY_STATIONS.get(density, 2)
+            deficit = max(0, target - current)
+            w = DENSITY_BASE_WEIGHT.get(density, 1.0) * (1.0 + deficit * 0.5)
+            weights.append(w)
+        return weights
+
+    def _decommission_weight(
+        self, station: StationRuntime, now: datetime, district_count: int
+    ) -> float:
+        if district_count <= 1:
+            return 0.0
+        TECH_OBSOLESCENCE = {"2G": 8.0, "3G": 3.0, "4G": 0.5, "5G": 0.0}
+        tech_weight = TECH_OBSOLESCENCE.get(station.technology, 1.0)
+        if station.install_date:
+            age_years = (now - station.install_date).total_seconds() / (365.25 * 86400)
+            age_weight = max(0.0, (age_years - 8) * 0.4)
+        else:
+            age_weight = 0.0
+        return tech_weight + age_weight
+
+    def maybe_upgrade_station(
+        self,
+        station: StationRuntime,
+        now: datetime,
+        rng: Optional[random.Random] = None,
+    ) -> Optional[dict]:
+        rng = rng or self.rng
+        if station.technology not in UPGRADE_TECH_PATH:
+            return None
+        if station.status != StationStatus.ACTIVE:
+            return None
+        district_count = self._district_station_count(station)
+        if station.technology not in ("2G", "3G") and district_count > 1:
+            return None
+        per_sec = UPGRADE_DAILY_PROB / 86400.0
+        if rng.random() > per_sec:
+            return None
+        old_tech = station.technology
+        new_tech = UPGRADE_TECH_PATH[old_tech]
+        station.technology = new_tech
+        return {
+            "event_type": EventType.CONFIG_CHANGE.value,
+            "severity": Severity.INFO.value,
+            "description": f"Technology upgrade: {old_tech} → {new_tech} at {station.station_code}",
+            "metadata": json.dumps({
+                "upgrade_type": "technology",
+                "old_technology": old_tech,
+                "new_technology": new_tech,
+                "district_sole_provider": district_count == 1,
+            }),
+        }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Data Generators
@@ -1324,7 +1488,7 @@ def generate_traffic_event(
     if station.weather_severity > 0:
         ws = station.weather_severity
         latency *= 1.0 + ws * 2.0
-        loss = min(loss + ws * 5.0, 100.0)
+        loss = min(loss + ws * 5.0, 99.9999)
         bytes_down = int(bytes_down * (1.0 - ws * 0.3))
 
     # Mass event causes congestion effects
@@ -1332,7 +1496,7 @@ def generate_traffic_event(
         latency *= 1.0 + (station.mass_event_sub_mult - 1.0) * 0.3
         loss += (station.mass_event_sub_mult - 1.0) * 0.5
 
-    loss = min(max(loss, 0.0), 100.0)
+    loss = min(max(loss, 0.0), 99.9999)
 
     packets_up = max(1, bytes_up // rng.randint(500, 1500))
     packets_down = max(1, bytes_down // rng.randint(500, 1500))
@@ -1342,6 +1506,7 @@ def generate_traffic_event(
     record = {
         "station_id": station.station_id,
         "event_time": event_time,
+        "propagation_delay": station.propagation_delay_sec,
         "imsi_hash": imsi_hash,
         "tmsi": rng.randint(100_000, 999_999),
         "ip_address": f"10.{rng.randint(0,255)}.{rng.randint(0,255)}.{rng.randint(1,254)}",
@@ -1417,6 +1582,7 @@ def generate_performance_metrics(
     return {
         "station_id": station.station_id,
         "metric_time": timestamp,
+        "propagation_delay": station.propagation_delay_sec,
         "cpu_usage_pct": round(min(100, max(0, cpu)), 2),
         "memory_usage_pct": round(min(100, max(0, 40 + load_frac * 40 + rng.gauss(0, 5))), 2),
         "disk_usage_pct": round(min(100, max(0, 30 + rng.gauss(0, 3))), 2),
@@ -1456,6 +1622,7 @@ def generate_station_event(
         return {
             "station_id": station.station_id,
             "event_time": event_time,
+            "propagation_delay": station.propagation_delay_sec,
             "event_type": override["event_type"],
             "severity": override.get("severity", Severity.INFO.value),
             "description": override.get("description", ""),
@@ -1521,6 +1688,7 @@ def generate_station_event(
         return {
             "station_id": station.station_id,
             "event_time": event_time,
+            "propagation_delay": station.propagation_delay_sec,
             "event_type": EventType.ALARM.value,
             "severity": alarm_sev.value,
             "description": rng.choice(alarm_types),
@@ -1538,6 +1706,7 @@ def generate_station_event(
     return {
         "station_id": station.station_id,
         "event_time": event_time,
+        "propagation_delay": station.propagation_delay_sec,
         "event_type": evt.value,
         "severity": severity,
         "description": f"{evt.value} at {station.station_code}",
@@ -1656,12 +1825,16 @@ CREATE TABLE IF NOT EXISTS telecom.subscriber_traffic (
     jitter_ms NUMERIC(10,2),
     packet_loss_pct NUMERIC(6,4) NOT NULL DEFAULT 0,
     connection_duration_ms INTEGER,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Index for watermark-based extraction (ETL reads WHERE created_at > watermark)
+-- Index for watermark-based extraction (ETL reads WHERE updated_at > watermark)
 CREATE INDEX IF NOT EXISTS idx_st_created_at
     ON telecom.subscriber_traffic(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_st_updated_at
+    ON telecom.subscriber_traffic(updated_at);
 
 -- Index for analytical queries by event time
 CREATE INDEX IF NOT EXISTS idx_st_event_time
@@ -1688,11 +1861,15 @@ CREATE TABLE IF NOT EXISTS telecom.performance_metrics (
     signal_strength_dbm NUMERIC(6,1),
     frequency_band VARCHAR(20),
     channel_utilization_pct NUMERIC(5,2),
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_pm_created_at
     ON telecom.performance_metrics(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_pm_updated_at
+    ON telecom.performance_metrics(updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_pm_metric_time
     ON telecom.performance_metrics(metric_time);
@@ -1711,11 +1888,15 @@ CREATE TABLE IF NOT EXISTS telecom.station_events (
     description TEXT,
     metadata JSONB,
     target_station_id INTEGER,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_se_created_at
     ON telecom.station_events(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_se_updated_at
+    ON telecom.station_events(updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_se_event_time
     ON telecom.station_events(event_time);
@@ -1745,6 +1926,34 @@ CREATE INDEX IF NOT EXISTS idx_cfg_station_current
 
 CREATE INDEX IF NOT EXISTS idx_cfg_updated_at
     ON telecom.configuration(updated_at);
+
+
+-- ── Auto-update trigger for updated_at ────────────────────────────────────
+-- Bumps updated_at on any UPDATE, so watermark-based CDC catches changes.
+CREATE OR REPLACE FUNCTION telecom.set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+    tbl TEXT;
+BEGIN
+    FOREACH tbl IN ARRAY ARRAY[
+        'subscriber_traffic', 'performance_metrics', 'station_events',
+        'base_station', 'operator', 'location', 'configuration'
+    ] LOOP
+        EXECUTE format(
+            'DROP TRIGGER IF EXISTS trg_updated_at ON telecom.%I; '
+            'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON telecom.%I '
+            'FOR EACH ROW EXECUTE FUNCTION telecom.set_updated_at();',
+            tbl, tbl
+        );
+    END LOOP;
+END $$;
 """
 
 
@@ -1843,6 +2052,9 @@ def create_stations(
                     install_date=install_date,
                     personality=personality,
                     status=StationStatus.ACTIVE,
+                    propagation_delay_sec=StationRuntime.compute_propagation_delay(
+                        location.get("density", "urban"), station_code,
+                    ),
                 )
                 stations.append(runtime)
 
@@ -1871,6 +2083,21 @@ def create_stations(
             and n.location.get("region") == s.location.get("region")
         ]
 
+    # Print propagation delay summary
+    delays = sorted([(s.station_code, s.propagation_delay_sec, s.location.get("density", "?")) for s in stations],
+                    key=lambda x: -x[1])
+    print(f"\n  Station propagation delays (station → client OLTP):")
+    print(f"    {'Station':<25} {'Density':<15} {'Delay':>8}")
+    print(f"    {'─'*25} {'─'*15} {'─'*8}")
+    for code, delay, density in delays[:10]:
+        print(f"    {code:<25} {density:<15} {delay:>6.1f}s")
+    if len(delays) > 10:
+        print(f"    ... and {len(delays)-10} more")
+    min_d = min(d for _, d, _ in delays)
+    max_d = max(d for _, d, _ in delays)
+    print(f"    Range: {min_d:.1f}s – {max_d:.1f}s")
+    print(f"    Client clock offset: +{CLIENT_CLOCK_OFFSET_SECONDS}s (client ahead of ETL)")
+    print(f"    created_at gap: {min_d:.1f}s – {max_d:.1f}s ahead of event_time\n")
     return stations
 
 
@@ -1904,6 +2131,7 @@ def insert_station_to_db(db: DatabaseManager, station: StationRuntime):
 
 def update_station_status(db: DatabaseManager, station: StationRuntime):
     """Update a station's status in the DB (for lifecycle changes)."""
+    # UPDATE uses plain NOW() — client timestamps its own corrections
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1916,69 +2144,154 @@ def update_station_status(db: DatabaseManager, station: StationRuntime):
 
 # ── Batch insert helpers ───────────────────────────────────────────────────
 
+def _compute_times(
+    ref_time: datetime,
+    propagation_delay: float,
+    rng: Optional[random.Random] = None,
+    is_backfill: bool = False,
+    apply_late_arrival: bool = False,
+) -> tuple[datetime, datetime]:
+    """Compute (event_time, created_at) from a reference timestamp.
+
+    Streaming (is_backfill=False):
+        ref_time = ETL_NOW (wall clock when simulator generates the record).
+        client_now = ref_time + offset − jitter
+        created_at = client_now              (client's wall clock when row is written)
+        event_time = client_now − propagation (station recorded it earlier)
+        Late arrival → event_time is pushed further into the past.
+
+    Backfill (is_backfill=True):
+        ref_time = synthetic event time (the actual moment the event happened).
+        event_time = ref_time
+        created_at = ref_time + propagation + offset  (forward computation)
+        Late arrival → created_at is pushed further into the future.
+    """
+    jitter = rng.uniform(*ETL_CLIENT_JITTER_RANGE) if rng else 0.0
+    late_extra = 0.0
+    if apply_late_arrival:
+        late_extra = float(rng.randint(*LATE_ARRIVAL_DELAY)) if rng else 0.0
+
+    if is_backfill:
+        event_time = ref_time
+        created_at_offset = propagation_delay + CLIENT_CLOCK_OFFSET_SECONDS + late_extra - jitter
+        created_at = ref_time + timedelta(seconds=created_at_offset)
+    else:
+        client_now = ref_time + timedelta(seconds=CLIENT_CLOCK_OFFSET_SECONDS - jitter)
+        created_at = client_now
+        event_time = client_now - timedelta(seconds=propagation_delay + late_extra)
+
+    return event_time, created_at
+
+
 def insert_traffic_batch(
     db: DatabaseManager,
     records: list[dict],
     late_arrival_rng: Optional[random.Random] = None,
-):
-    """Insert traffic records. Some may have late created_at."""
+    is_backfill: bool = False,
+) -> list[int]:
+    """Insert traffic records. Returns list of inserted traffic_ids.
+
+    Time model:
+      Streaming:  created_at ≈ ETL_NOW + offset  (just ~60s ahead of ETL)
+                  event_time = created_at − propagation [− late_extra]
+      Backfill:   event_time = ref_time (given)
+                  created_at = event_time + propagation + offset [+ late_extra]
+
+    The gap (created_at − event_time) is always propagation + offset [+ late],
+    but created_at's absolute position is only ~offset ahead of ETL in streaming.
+    ETL buffer only needs to cover offset + margin (~90s), not propagation.
+    """
     if not records:
-        return
+        return []
+
+    inserted_ids: list[int] = []
+
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
             for r in records:
-                params = [
-                    r["station_id"], r["event_time"], r["imsi_hash"],
+                propagation = r.get("propagation_delay", 2.0)
+
+                is_late = (
+                    late_arrival_rng is not None
+                    and late_arrival_rng.random() < LATE_ARRIVAL_PROB
+                )
+                event_time, created_at = _compute_times(
+                    ref_time=r["event_time"],
+                    propagation_delay=propagation,
+                    rng=late_arrival_rng,
+                    is_backfill=is_backfill,
+                    apply_late_arrival=is_late,
+                )
+
+                cur.execute("""
+                    INSERT INTO telecom.subscriber_traffic
+                        (station_id, event_time, imsi_hash, tmsi, ip_address,
+                         destination_ip, destination_port, protocol,
+                         bytes_up, bytes_down, packets_up, packets_down,
+                         latency_ms, jitter_ms, packet_loss_pct,
+                         connection_duration_ms, created_at, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING traffic_id
+                """, (
+                    r["station_id"], event_time, r["imsi_hash"],
                     r.get("tmsi"), r.get("ip_address"), r.get("destination_ip"),
                     r.get("destination_port"), r.get("protocol"),
                     r.get("bytes_up"), r.get("bytes_down"),
                     r.get("packets_up"), r.get("packets_down"),
                     r.get("latency_ms"), r.get("jitter_ms"),
                     r.get("packet_loss_pct"), r.get("connection_duration_ms"),
-                ]
+                    created_at, created_at,
+                ))
 
-                if late_arrival_rng and late_arrival_rng.random() < LATE_ARRIVAL_PROB:
-                    # Late arrival: record was generated at event_time but didn't
-                    # reach the OLTP until event_time + delay seconds later.
-                    delay = late_arrival_rng.randint(*LATE_ARRIVAL_DELAY)
-                    late_params = params + [r["event_time"], delay]
-                    cur.execute("""
-                        INSERT INTO telecom.subscriber_traffic
-                            (station_id, event_time, imsi_hash, tmsi, ip_address,
-                             destination_ip, destination_port, protocol,
-                             bytes_up, bytes_down, packets_up, packets_down,
-                             latency_ms, jitter_ms, packet_loss_pct,
-                             connection_duration_ms, created_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s + make_interval(secs => %s))
-                    """, late_params)
-                else:
-                    cur.execute("""
-                        INSERT INTO telecom.subscriber_traffic
-                            (station_id, event_time, imsi_hash, tmsi, ip_address,
-                             destination_ip, destination_port, protocol,
-                             bytes_up, bytes_down, packets_up, packets_down,
-                             latency_ms, jitter_ms, packet_loss_pct,
-                             connection_duration_ms)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, params)
+                row = cur.fetchone()
+                if row:
+                    inserted_ids.append(row[0])
 
-                # Maybe insert a duplicate
+                # Maybe insert a duplicate (same event_time, slightly different created_at)
                 if late_arrival_rng and late_arrival_rng.random() < DUPLICATE_RECORD_PROB:
+                    dup_event_time, dup_created_at = _compute_times(
+                        ref_time=r["event_time"],
+                        propagation_delay=propagation,
+                        rng=late_arrival_rng,
+                        is_backfill=is_backfill,
+                        apply_late_arrival=False,
+                    )
                     cur.execute("""
                         INSERT INTO telecom.subscriber_traffic
                             (station_id, event_time, imsi_hash, tmsi, ip_address,
                              destination_ip, destination_port, protocol,
                              bytes_up, bytes_down, packets_up, packets_down,
                              latency_ms, jitter_ms, packet_loss_pct,
-                             connection_duration_ms)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, params[:16])
+                             connection_duration_ms, created_at, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (
+                        r["station_id"], dup_event_time, r["imsi_hash"],
+                        r.get("tmsi"), r.get("ip_address"), r.get("destination_ip"),
+                        r.get("destination_port"), r.get("protocol"),
+                        r.get("bytes_up"), r.get("bytes_down"),
+                        r.get("packets_up"), r.get("packets_down"),
+                        r.get("latency_ms"), r.get("jitter_ms"),
+                        r.get("packet_loss_pct"), r.get("connection_duration_ms"),
+                        dup_created_at, dup_created_at,
+                    ))
 
         conn.commit()
+    return inserted_ids
 
 
-def insert_metrics(db: DatabaseManager, record: dict):
+def insert_metrics(
+    db: DatabaseManager,
+    record: dict,
+    is_backfill: bool = False,
+    rng: Optional[random.Random] = None,
+) -> Optional[int]:
+    propagation = record.get("propagation_delay", 2.0)
+    metric_time, created_at = _compute_times(
+        ref_time=record["metric_time"],
+        propagation_delay=propagation,
+        rng=rng,
+        is_backfill=is_backfill,
+    )
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1987,37 +2300,234 @@ def insert_metrics(db: DatabaseManager, record: dict):
                      disk_usage_pct, temperature_celsius, power_consumption_watts,
                      uplink_throughput_mbps, downlink_throughput_mbps,
                      active_subscribers, signal_strength_dbm,
-                     frequency_band, channel_utilization_pct)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     frequency_band, channel_utilization_pct,
+                     created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING metric_id
             """, (
-                record["station_id"], record["metric_time"],
+                record["station_id"], metric_time,
                 record["cpu_usage_pct"], record["memory_usage_pct"],
                 record["disk_usage_pct"], record["temperature_celsius"],
                 record["power_consumption_watts"],
                 record["uplink_throughput_mbps"], record["downlink_throughput_mbps"],
                 record["active_subscribers"], record["signal_strength_dbm"],
                 record["frequency_band"], record["channel_utilization_pct"],
+                created_at, created_at,
             ))
+            row = cur.fetchone()
         conn.commit()
+    return row[0] if row else None
 
 
-def insert_event(db: DatabaseManager, record: Optional[dict]):
+def insert_event(
+    db: DatabaseManager,
+    record: Optional[dict],
+    is_backfill: bool = False,
+    rng: Optional[random.Random] = None,
+) -> Optional[int]:
     if not record:
-        return
+        return None
+    propagation = record.get("propagation_delay", 2.0)
+    event_time, created_at = _compute_times(
+        ref_time=record["event_time"],
+        propagation_delay=propagation,
+        rng=rng,
+        is_backfill=is_backfill,
+    )
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO telecom.station_events
                     (station_id, event_time, event_type, severity,
-                     description, metadata, target_station_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                     description, metadata, target_station_id,
+                     created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING event_id
             """, (
-                record["station_id"], record["event_time"],
+                record["station_id"], event_time,
                 record["event_type"], record["severity"],
                 record.get("description"), record.get("metadata"),
                 record.get("target_station_id"),
+                created_at, created_at,
             ))
+            row = cur.fetchone()
         conn.commit()
+    return row[0] if row else None
+
+
+# ── UPDATE simulation — forces ETL to handle row mutations ────────────────
+
+def simulate_traffic_corrections(
+    db: DatabaseManager,
+    traffic_ids: list[int],
+    rng: random.Random,
+):
+    """Simulate CDR corrections: adjust bytes/duration on recently inserted traffic.
+    
+    In real telecom, the initial CDR is an estimate. After the session fully
+    closes, the system reconciles actual byte counts and duration. This UPDATE
+    bumps updated_at, forcing the ETL to re-extract and re-process the row.
+    """
+    if not traffic_ids:
+        return 0
+
+    to_correct = [tid for tid in traffic_ids if rng.random() < TRAFFIC_UPDATE_PROB]
+    if not to_correct:
+        return 0
+
+    # UPDATE uses plain NOW() — client timestamps its own corrections
+    corrected = 0
+    with _pg_conn(db) as conn:
+        with conn.cursor() as cur:
+            for tid in to_correct:
+                # CDR correction: adjust bytes by ±5-30%, set final duration
+                bytes_factor = rng.uniform(0.7, 1.3)
+                duration_adjust = rng.randint(-5000, 15000)
+                cur.execute("""
+                    UPDATE telecom.subscriber_traffic
+                    SET bytes_up = GREATEST(0, (bytes_up * %s)::BIGINT),
+                        bytes_down = GREATEST(0, (bytes_down * %s)::BIGINT),
+                        connection_duration_ms = GREATEST(100,
+                            COALESCE(connection_duration_ms, 0) + %s),
+                        updated_at = NOW()
+                    WHERE traffic_id = %s
+                """, (bytes_factor, bytes_factor, duration_adjust, tid))
+                corrected += 1
+        conn.commit()
+    return corrected
+
+
+def simulate_event_enrichment(
+    db: DatabaseManager,
+    event_ids: list[int],
+    rng: random.Random,
+):
+    """Simulate event metadata enrichment: add root_cause, affected_count, etc.
+    
+    In real telecom, events initially log with minimal metadata.
+    A downstream system later enriches them with correlation analysis.
+    """
+    if not event_ids:
+        return 0
+
+    to_enrich = [eid for eid in event_ids if rng.random() < EVENT_ENRICHMENT_PROB]
+    if not to_enrich:
+        return 0
+
+    # UPDATE uses plain NOW() — client timestamps its own corrections
+    enriched = 0
+    root_causes = [
+        "hardware_aging", "software_bug", "config_drift", "power_fluctuation",
+        "backhaul_congestion", "interference", "overload", "firmware_regression",
+    ]
+    with _pg_conn(db) as conn:
+        with conn.cursor() as cur:
+            for eid in to_enrich:
+                enrichment = json.dumps({
+                    "root_cause": rng.choice(root_causes),
+                    "affected_subscribers": rng.randint(0, 500),
+                    "correlated_alarms": rng.randint(0, 10),
+                    "enriched_at": datetime.now(timezone.utc).isoformat(),
+                })
+                cur.execute("""
+                    UPDATE telecom.station_events
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE event_id = %s
+                """, (enrichment, eid))
+                enriched += 1
+        conn.commit()
+    return enriched
+
+
+def simulate_metric_recalibration(
+    db: DatabaseManager,
+    metric_ids: list[int],
+    rng: random.Random,
+):
+    """Simulate sensor recalibration: adjust temperature/CPU readings.
+    
+    Sensors drift over time. After periodic calibration, recent readings
+    are retroactively adjusted. Typically affects temperature and signal.
+    """
+    if not metric_ids:
+        return 0
+
+    to_recalibrate = [mid for mid in metric_ids if rng.random() < METRIC_RECALIBRATION_PROB]
+    if not to_recalibrate:
+        return 0
+
+    # UPDATE uses plain NOW() — client timestamps its own corrections
+    recalibrated = 0
+    with _pg_conn(db) as conn:
+        with conn.cursor() as cur:
+            for mid in to_recalibrate:
+                temp_offset = rng.uniform(-3.0, 3.0)
+                signal_offset = rng.uniform(-2.0, 2.0)
+                cur.execute("""
+                    UPDATE telecom.performance_metrics
+                    SET temperature_celsius = GREATEST(15,
+                            LEAST(95, temperature_celsius + %s)),
+                        signal_strength_dbm = GREATEST(-120,
+                            LEAST(-30, signal_strength_dbm + %s)),
+                        updated_at = NOW()
+                    WHERE metric_id = %s
+                """, (temp_offset, signal_offset, mid))
+                recalibrated += 1
+        conn.commit()
+    return recalibrated
+
+
+def simulate_soft_deletes(
+    db: DatabaseManager,
+    rng: random.Random,
+):
+    """Simulate soft deletes on dimension tables.
+    
+    Operators get acquired/merged, locations get redistricted.
+    Sets is_deleted = true and bumps updated_at. The ETL must detect
+    this via watermark on updated_at and propagate the flag downstream.
+    Station decommissioning is handled separately via status lifecycle.
+    """
+    # UPDATE uses plain NOW() — client timestamps its own corrections
+    deleted = 0
+
+    with _pg_conn(db) as conn:
+        with conn.cursor() as cur:
+            # Soft-delete a random operator (rare — mergers/acquisitions)
+            if rng.random() < SOFT_DELETE_DAILY_PROB:
+                cur.execute("""
+                    SELECT operator_id FROM telecom.operator
+                    WHERE is_deleted = false
+                    ORDER BY RANDOM() LIMIT 1
+                """)
+                row = cur.fetchone()
+                if row:
+                    cur.execute("""
+                        UPDATE telecom.operator
+                        SET is_deleted = true, updated_at = NOW()
+                        WHERE operator_id = %s
+                    """, (row[0],))
+                    deleted += 1
+
+            # Soft-delete a random location (redistricting)
+            if rng.random() < SOFT_DELETE_DAILY_PROB:
+                cur.execute("""
+                    SELECT location_id FROM telecom.location
+                    WHERE is_deleted = false
+                    ORDER BY RANDOM() LIMIT 1
+                """)
+                row = cur.fetchone()
+                if row:
+                    cur.execute("""
+                        UPDATE telecom.location
+                        SET is_deleted = true, updated_at = NOW()
+                        WHERE location_id = %s
+                    """, (row[0],))
+                    deleted += 1
+
+        conn.commit()
+    return deleted
 
 
 def insert_config_change(db: DatabaseManager, station: StationRuntime, ts: datetime, rng: random.Random):
@@ -2025,6 +2535,7 @@ def insert_config_change(db: DatabaseManager, station: StationRuntime, ts: datet
     new_tech = station.technology
     new_band = rng.choice(FREQUENCY_BANDS.get(new_tech, ["unknown"]))
     new_max_ues = str(TECHNOLOGIES[new_tech]["max_subs"])
+    # UPDATE uses plain NOW() — client timestamps its own corrections
 
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
@@ -2039,13 +2550,15 @@ def insert_config_change(db: DatabaseManager, station: StationRuntime, ts: datet
             # Insert new configs
             cur.execute("""
                 INSERT INTO telecom.configuration
-                    (station_id, config_key, config_value, effective_from, is_current)
-                VALUES (%s, 'frequency_band', %s, %s, true)
+                    (station_id, config_key, config_value, effective_from, is_current,
+                     created_at, updated_at)
+                VALUES (%s, 'frequency_band', %s, %s, true, NOW(), NOW())
             """, (station.station_id, new_band, ts))
             cur.execute("""
                 INSERT INTO telecom.configuration
-                    (station_id, config_key, config_value, effective_from, is_current)
-                VALUES (%s, 'max_connected_ues', %s, %s, true)
+                    (station_id, config_key, config_value, effective_from, is_current,
+                     created_at, updated_at)
+                VALUES (%s, 'max_connected_ues', %s, %s, true, NOW(), NOW())
             """, (station.station_id, new_max_ues, ts))
         conn.commit()
 
@@ -2082,17 +2595,24 @@ class StationWorker(threading.Thread):
 
         for s in stations:
             self.stats[s.station_code] = {
-                "traffic": 0, "metrics": 0, "events": 0, "errors": 0,
+                "traffic": 0, "metrics": 0, "events": 0, "errors": 0, "updates": 0,
             }
 
     def run(self):
         last_metric_time = time.time()
         last_mobility_time = time.time()
         last_scenario_time = time.time()
+        last_correction_time = time.time()
         metric_interval = 60
         mobility_interval = 300
         scenario_interval = 10       # Check cluster/weather every 10s
+        correction_interval = 120    # Run UPDATE simulation every 2 min
         traffic_buffer: list[dict] = []
+
+        # Accumulate recently inserted IDs for UPDATE simulation
+        pending_traffic_ids: list[int] = []
+        pending_event_ids: list[int] = []
+        pending_metric_ids: list[int] = []
 
         while not self.stop_event.is_set():
             try:
@@ -2154,15 +2674,18 @@ class StationWorker(threading.Thread):
                         self.stats[station.station_code]["traffic"] += 1
 
                     if len(traffic_buffer) >= self.traffic_batch_size:
-                        insert_traffic_batch(self.db, traffic_buffer, self.rng)
+                        ids = insert_traffic_batch(self.db, traffic_buffer, self.rng)
+                        pending_traffic_ids.extend(ids)
                         traffic_buffer.clear()
 
                     # ── Scenarios ───────────────────────────────────────────
                     incident = self.scenario_engine.maybe_trigger_incident(station, now, self.rng)
                     if incident:
-                        insert_event(self.db, generate_station_event(
+                        eid = insert_event(self.db, generate_station_event(
                             station, self.all_stations, now, self.rng, incident
                         ))
+                        if eid:
+                            pending_event_ids.append(eid)
                         self.stats[station.station_code]["events"] += 1
                         if station.status == StationStatus.DOWN:
                             self.scenario_engine.trigger_cascading_load(station, self.subscriber_pool, self.rng)
@@ -2197,6 +2720,16 @@ class StationWorker(threading.Thread):
                         ))
                         self.stats[station.station_code]["events"] += 1
 
+                    # Upgrade
+                    upgrade = self.scenario_engine.maybe_upgrade_station(station, now, self.rng)
+                    if upgrade:
+                        eid = insert_event(self.db, generate_station_event(
+                            station, self.all_stations, now, self.rng, upgrade
+                        ))
+                        insert_config_change(self.db, station, now, self.rng)
+                        update_station_status(self.db, station)
+                        self.stats[station.station_code]["events"] += 1
+
                     # Decommission check
                     decom = self.scenario_engine.maybe_decommission_station(
                         station, now, self.subscriber_pool, self.all_stations, self.rng,
@@ -2211,7 +2744,9 @@ class StationWorker(threading.Thread):
                     # ── Organic events ─────────────────────────────────────
                     organic = generate_station_event(station, self.all_stations, now, self.rng)
                     if organic:
-                        insert_event(self.db, organic)
+                        eid = insert_event(self.db, organic)
+                        if eid:
+                            pending_event_ids.append(eid)
                         self.stats[station.station_code]["events"] += 1
 
                 # ── Periodic: metrics ──────────────────────────────────────
@@ -2224,7 +2759,9 @@ class StationWorker(threading.Thread):
                             if s["current_station"] == station.station_code
                         )
                         metrics = generate_performance_metrics(station, now, active_count, self.rng)
-                        insert_metrics(self.db, metrics)
+                        mid = insert_metrics(self.db, metrics)
+                        if mid:
+                            pending_metric_ids.append(mid)
                         self.stats[station.station_code]["metrics"] += 1
                     last_metric_time = time.time()
 
@@ -2237,8 +2774,32 @@ class StationWorker(threading.Thread):
 
                 # Flush remaining traffic
                 if traffic_buffer:
-                    insert_traffic_batch(self.db, traffic_buffer, self.rng)
+                    ids = insert_traffic_batch(self.db, traffic_buffer, self.rng)
+                    pending_traffic_ids.extend(ids)
                     traffic_buffer.clear()
+
+                # ── Periodic: UPDATE simulation (corrections) ─────────
+                if time.time() - last_correction_time >= correction_interval:
+                    n_updates = 0
+                    n_updates += simulate_traffic_corrections(
+                        self.db, pending_traffic_ids, self.rng,
+                    )
+                    n_updates += simulate_event_enrichment(
+                        self.db, pending_event_ids, self.rng,
+                    )
+                    n_updates += simulate_metric_recalibration(
+                        self.db, pending_metric_ids, self.rng,
+                    )
+                    if n_updates > 0:
+                        # Attribute updates to first station for stats
+                        first_code = self.stations[0].station_code
+                        self.stats[first_code]["updates"] += n_updates
+
+                    # Clear pending buffers
+                    pending_traffic_ids.clear()
+                    pending_event_ids.clear()
+                    pending_metric_ids.clear()
+                    last_correction_time = time.time()
 
                 time.sleep(self.rng.uniform(0.8, 1.2))
 
@@ -2278,6 +2839,7 @@ class GlobalScenarioThread(threading.Thread):
         self.rng = rng
         self.next_station_id = max(s.station_id for s in stations) + 1 if stations else 1
         self.last_firmware_check = time.time()
+        self.last_soft_delete_check = time.time()
 
     def run(self):
         while not self.stop_event.is_set():
@@ -2328,7 +2890,7 @@ class GlobalScenarioThread(threading.Thread):
                         # Add to stats if new
                         if station.station_code not in self.stats:
                             self.stats[station.station_code] = {
-                                "traffic": 0, "metrics": 0, "events": 0, "errors": 0,
+                                "traffic": 0, "metrics": 0, "events": 0, "errors": 0, "updates": 0,
                             }
 
                 # ── New station commissioning ──────────────────────────────
@@ -2348,7 +2910,7 @@ class GlobalScenarioThread(threading.Thread):
                             new_station, self.stations, now, self.rng, ev
                         ))
                     self.stats[new_station.station_code] = {
-                        "traffic": 0, "metrics": 0, "events": 0, "errors": 0,
+                        "traffic": 0, "metrics": 0, "events": 0, "errors": 0, "updates": 0,
                     }
                     print(f"  📡 New station commissioned: {new_station.station_code}")
 
@@ -2365,6 +2927,13 @@ class GlobalScenarioThread(threading.Thread):
                         if events:
                             print(f"  🔧 Firmware rollout affecting {len(events)} stations")
                     self.last_firmware_check = time.time()
+
+                # ── Soft deletes (daily check) ──────────────────────────
+                if time.time() - self.last_soft_delete_check > 3600:
+                    n_del = simulate_soft_deletes(self.db, self.rng)
+                    if n_del:
+                        print(f"  🗑️ Soft-deleted {n_del} dimension row(s)")
+                    self.last_soft_delete_check = time.time()
 
                 time.sleep(5)
 
@@ -2397,9 +2966,24 @@ def run_backfill(
     print(f"Estimated traffic records: ~{est_traffic:,}")
     print(f"{'='*60}\n")
 
+    # ── Backfill wrappers: bind is_backfill=True so every call site stays clean ──
+    _insert_event_orig = insert_event
+    _insert_metrics_orig = insert_metrics
+    _insert_traffic_orig = insert_traffic_batch
+
+    def _bf_insert_event(db_ref, record):
+        return _insert_event_orig(db_ref, record, is_backfill=True, rng=rng)
+
+    def _bf_insert_metrics(db_ref, record):
+        return _insert_metrics_orig(db_ref, record, is_backfill=True, rng=rng)
+
+    def _bf_insert_traffic(db_ref, records, late_rng=None):
+        return _insert_traffic_orig(db_ref, records, late_arrival_rng=late_rng, is_backfill=True)
+
     total_traffic = 0
     total_metrics = 0
     total_events = 0
+    total_updates = 0
     next_station_id = max(s.station_id for s in stations) + 1 if stations else 1
 
     for day_offset in range(num_days):
@@ -2424,7 +3008,7 @@ def run_backfill(
                     station, maint_start, maint_duration, upgrade,
                 )
                 for me in maint_events:
-                    insert_event(db, generate_station_event(
+                    _bf_insert_event(db, generate_station_event(
                         station, stations, maint_start, rng, me,
                     ))
                     day_events += 1
@@ -2438,7 +3022,7 @@ def run_backfill(
             for ev in fw_events:
                 station = ev.pop("station", None)
                 if station:
-                    insert_event(db, generate_station_event(
+                    _bf_insert_event(db, generate_station_event(
                         station, stations, day_start, rng, ev,
                     ))
                     day_events += 1
@@ -2448,9 +3032,12 @@ def run_backfill(
         # ── Daily: maybe commission new station ────────────────────────────
         if rng.random() < NEW_STATION_DAILY_PROB:
             commission_time = day_start + timedelta(hours=rng.randint(6, 18))
-            location = rng.choice(LOCATIONS)
+            location_weights = scenario_engine._commissioning_location_weights()
+            location = rng.choices(LOCATIONS, weights=location_weights)[0]
             operator = rng.choices(OPERATORS, weights=OPERATOR_WEIGHTS)[0]
-            technology = rng.choices(TECH_NAMES, weights=TECH_WEIGHTS)[0]
+            density = location.get("density", "urban")
+            tech_profile = NEW_STATION_TECH_BY_DENSITY[density]
+            technology = rng.choices(list(tech_profile.keys()), weights=list(tech_profile.values()))[0]
 
             station_code = f"{operator['code']}-{location['province'][:3].upper()}-{next_station_id:04d}"
             personality = StationPersonality.from_seed(station_code)
@@ -2472,6 +3059,9 @@ def run_backfill(
                 personality=personality,
                 status=StationStatus.PROVISIONING,
                 commissioned_at=commission_time,
+                propagation_delay_sec=StationRuntime.compute_propagation_delay(
+                    location.get("density", "urban"), station_code,
+                ),
             )
 
             # Queue lifecycle transitions
@@ -2500,23 +3090,37 @@ def run_backfill(
                     "provisioning_hours": provision_hours, "testing_hours": testing_hours,
                 }),
             }
-            insert_event(db, generate_station_event(new_station, stations, commission_time, rng, ev))
+            _bf_insert_event(db, generate_station_event(new_station, stations, commission_time, rng, ev))
             day_events += 1
             print(f"[new:{new_station.station_code}]", end=" ", flush=True)
 
         # ── Daily: maybe decommission old station ──────────────────────────
         for station in list(stations):
+            if station.status != StationStatus.ACTIVE:
+                continue
+            upgrade = scenario_engine.maybe_upgrade_station(station, day_start, rng)
+            if upgrade:
+                _bf_insert_event(db, generate_station_event(station, stations, day_start, rng, upgrade))
+                insert_config_change(db, station, day_start, rng)
+                update_station_status(db, station)
+                day_events += 1
             if rng.random() < DECOMMISSION_DAILY_PROB:
                 decom = scenario_engine.maybe_decommission_station(
                     station, day_start, subscriber_pool, stations,
                 )
                 if decom:
-                    insert_event(db, generate_station_event(
+                    _bf_insert_event(db, generate_station_event(
                         station, stations, day_start, rng, decom,
                     ))
                     update_station_status(db, station)
                     day_events += 1
                     print(f"[decom:{station.station_code}]", end=" ", flush=True)
+
+        # ── Daily: maybe soft-delete dimension rows ──────────────────────
+        n_deletes = simulate_soft_deletes(db, rng)
+        if n_deletes:
+            total_updates += n_deletes
+            print(f"[soft-del:{n_deletes}]", end=" ", flush=True)
 
         # ── Hourly processing ──────────────────────────────────────────────
         for hour in range(24):
@@ -2525,6 +3129,9 @@ def run_backfill(
 
             subscriber_pool.simulate_mobility(stations, hour, rng)
             traffic_buffer: list[dict] = []
+            pending_traffic_ids: list[int] = []
+            pending_event_ids: list[int] = []
+            pending_metric_ids: list[int] = []
 
             # ── Cluster event check (once per hour) ────────────────────────
             cluster_prob = CLUSTER_EVENT_HOURLY_PROB
@@ -2566,7 +3173,7 @@ def run_backfill(
                                 "estimated_duration_min": duration,
                             }),
                         }
-                        insert_event(db, generate_station_event(s, stations, hour_start, rng, ev))
+                        _bf_insert_event(db, generate_station_event(s, stations, hour_start, rng, ev))
                         day_events += 1
 
                     print(f"[cluster:{event_type[:5]}]", end=" ", flush=True)
@@ -2576,7 +3183,7 @@ def run_backfill(
             for ev in resolved_events:
                 station = ev.pop("station", None)
                 if station:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
                     update_station_status(db, station)
                     day_events += 1
 
@@ -2610,7 +3217,7 @@ def run_backfill(
                                 "estimated_duration_min": duration,
                             }),
                         }
-                        insert_event(db, generate_station_event(s, stations, hour_start, rng, ev))
+                        _bf_insert_event(db, generate_station_event(s, stations, hour_start, rng, ev))
                         day_events += 1
 
                     print(f"[weather:{region[:5]}]", end=" ", flush=True)
@@ -2619,14 +3226,14 @@ def run_backfill(
             for ev in scenario_engine.maybe_resolve_weather(hour_start):
                 station = ev.pop("station", None)
                 if station:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
                     day_events += 1
 
             # ── Lifecycle queue ────────────────────────────────────────────
             for ev in scenario_engine.process_lifecycle_queue(hour_start):
                 station = ev.pop("station", None)
                 if station:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, ev))
                     update_station_status(db, station)
                     day_events += 1
 
@@ -2638,26 +3245,26 @@ def run_backfill(
                 # Maintenance resolution
                 maint_end = scenario_engine.maybe_end_maintenance(station, hour_start)
                 if maint_end:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, maint_end))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, maint_end))
                     update_station_status(db, station)
                     day_events += 1
 
                 # Incident resolution
                 resolved = scenario_engine.maybe_resolve_incident(station, hour_start)
                 if resolved:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, resolved))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, resolved))
                     day_events += 1
 
                 # Firmware reboot
                 fw = scenario_engine.maybe_firmware_reboot(station, hour_start)
                 if fw:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, fw))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, fw))
                     day_events += 1
 
                 if station.status in (StationStatus.MAINTENANCE, StationStatus.DOWN, StationStatus.DECOMMISSIONING):
                     # Still generate metrics showing station is down
                     metrics = generate_performance_metrics(station, hour_start, 0, rng)
-                    insert_metrics(db, metrics)
+                    _bf_insert_metrics(db, metrics)
                     total_metrics += 1
                     continue
 
@@ -2673,12 +3280,12 @@ def run_backfill(
                 # Mass event check
                 me = scenario_engine.maybe_trigger_mass_event(station, hour_start)
                 if me:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, me))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, me))
                     day_events += 1
 
                 me_end = scenario_engine.maybe_end_mass_event(station, hour_start)
                 if me_end:
-                    insert_event(db, generate_station_event(station, stations, hour_start, rng, me_end))
+                    _bf_insert_event(db, generate_station_event(station, stations, hour_start, rng, me_end))
                     day_events += 1
 
                 for j in range(n_events):
@@ -2721,7 +3328,7 @@ def run_backfill(
                             "estimated_duration_min": duration,
                         }),
                     }
-                    insert_event(db, generate_station_event(station, stations, incident_time, rng, ev))
+                    _bf_insert_event(db, generate_station_event(station, stations, incident_time, rng, ev))
                     day_events += 1
 
                     if station.status == StationStatus.DOWN:
@@ -2734,7 +3341,9 @@ def run_backfill(
                     evt_time = hour_start + timedelta(seconds=rng.randint(0, 3599))
                     ev = generate_station_event(station, stations, evt_time, rng)
                     if ev:
-                        insert_event(db, ev)
+                        eid = _bf_insert_event(db, ev)
+                        if eid:
+                            pending_event_ids.append(eid)
                         day_events += 1
 
                 # ── Metrics ────────────────────────────────────────────────
@@ -2743,14 +3352,24 @@ def run_backfill(
                     if s["current_station"] == station.station_code
                 )
                 metrics = generate_performance_metrics(station, hour_start, active_count, rng)
-                insert_metrics(db, metrics)
+                mid = _bf_insert_metrics(db, metrics)
+                if mid:
+                    pending_metric_ids.append(mid)
                 total_metrics += 1
 
             # Flush traffic
             if traffic_buffer:
-                insert_traffic_batch(db, traffic_buffer, rng)
+                ids = _bf_insert_traffic(db, traffic_buffer, rng)
+                pending_traffic_ids.extend(ids)
                 day_traffic += len(traffic_buffer)
                 traffic_buffer.clear()
+
+            # ── End-of-hour: simulate UPDATE corrections ──────────────
+            hour_updates = 0
+            hour_updates += simulate_traffic_corrections(db, pending_traffic_ids, rng)
+            hour_updates += simulate_event_enrichment(db, pending_event_ids, rng)
+            hour_updates += simulate_metric_recalibration(db, pending_metric_ids, rng)
+            total_updates += hour_updates
 
             if (hour + 1) % 6 == 0:
                 print(f"[h{hour+1}: {day_traffic:,}t]", end=" ", flush=True)
@@ -2775,6 +3394,7 @@ def run_backfill(
     print(f"  Traffic records: {total_traffic:,}")
     print(f"  Metric records:  {total_metrics:,}")
     print(f"  Event records:   {total_events:,}")
+    print(f"  Row updates:     {total_updates:,}")
     print(f"  Final stations:  {len(stations)}")
     print(f"{'='*60}")
 
@@ -2792,10 +3412,12 @@ def print_stats(stats: dict, start_time: float):
     total_metrics = sum(s["metrics"] for s in stats.values())
     total_events = sum(s["events"] for s in stats.values())
     total_errors = sum(s["errors"] for s in stats.values())
+    total_updates = sum(s.get("updates", 0) for s in stats.values())
 
     print(f"\n{'='*60}")
     print(f"Elapsed: {elapsed:.0f}s | Traffic: {total_traffic:,} ({total_traffic/elapsed:.1f}/s) | "
-          f"Metrics: {total_metrics:,} | Events: {total_events:,} | Errors: {total_errors}")
+          f"Metrics: {total_metrics:,} | Events: {total_events:,} | "
+          f"Updates: {total_updates:,} | Errors: {total_errors}")
     print(f"Stations: {len(stats)}")
     print(f"{'='*60}")
 
@@ -2846,6 +3468,16 @@ def main():
                         help="Fraction of records with null fields")
         p.add_argument("--duplicate-prob", type=float, default=DUPLICATE_RECORD_PROB,
                         help="Fraction of records that are duplicated")
+        p.add_argument("--traffic-update-prob", type=float, default=TRAFFIC_UPDATE_PROB,
+                        help="Fraction of traffic records corrected after insert")
+        p.add_argument("--event-enrichment-prob", type=float, default=EVENT_ENRICHMENT_PROB,
+                        help="Fraction of events enriched with metadata after insert")
+        p.add_argument("--metric-recalib-prob", type=float, default=METRIC_RECALIBRATION_PROB,
+                        help="Fraction of metrics recalibrated after insert")
+        p.add_argument("--soft-delete-prob", type=float, default=SOFT_DELETE_DAILY_PROB,
+                        help="Daily probability of soft-deleting a dimension row")
+        p.add_argument("--client-clock-offset", type=int, default=CLIENT_CLOCK_OFFSET_SECONDS,
+                        help="Client clock ahead of ETL clock by this many seconds (default 60)")
 
     # ── Stream command ─────────────────────────────────────────────────────
     sp = subparsers.add_parser("stream", help="Continuous streaming mode")
@@ -2871,6 +3503,8 @@ def main():
     global INCIDENT_HOURLY_PROB, CLUSTER_EVENT_HOURLY_PROB, WEATHER_EVENT_HOURLY_PROB
     global MASS_EVENT_DAILY_PROB, FIRMWARE_ROLLOUT_PROB, NEW_STATION_DAILY_PROB
     global DECOMMISSION_DAILY_PROB, LATE_ARRIVAL_PROB, NULL_FIELD_PROB, DUPLICATE_RECORD_PROB
+    global TRAFFIC_UPDATE_PROB, EVENT_ENRICHMENT_PROB, METRIC_RECALIBRATION_PROB
+    global SOFT_DELETE_DAILY_PROB, CLIENT_CLOCK_OFFSET_SECONDS
 
     INCIDENT_HOURLY_PROB      = args.incident_prob
     CLUSTER_EVENT_HOURLY_PROB = args.cluster_event_prob
@@ -2882,6 +3516,11 @@ def main():
     LATE_ARRIVAL_PROB         = args.late_arrival_prob
     NULL_FIELD_PROB           = args.null_prob
     DUPLICATE_RECORD_PROB     = args.duplicate_prob
+    TRAFFIC_UPDATE_PROB       = args.traffic_update_prob
+    EVENT_ENRICHMENT_PROB     = args.event_enrichment_prob
+    METRIC_RECALIBRATION_PROB = args.metric_recalib_prob
+    SOFT_DELETE_DAILY_PROB    = args.soft_delete_prob
+    CLIENT_CLOCK_OFFSET_SECONDS = args.client_clock_offset
 
     # Deterministic seeding
     rng = random.Random(args.seed)

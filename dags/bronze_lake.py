@@ -56,7 +56,7 @@ with DAG(
                 "tmsi", "ip_address", "destination_ip", "destination_port",
                 "protocol", "bytes_up", "bytes_down", "packets_up", "packets_down",
                 "latency_ms", "jitter_ms", "packet_loss_pct", "connection_duration_ms",
-                "ingested_at", "batch_id"
+                "created_at", "updated_at"
             ],
             batch_id=f"st_{context['run_id']}",
             cutoff_time=context['data_interval_start'],
@@ -119,7 +119,7 @@ with DAG(
             pk_column="event_id",
             target_columns=[
                 "event_id", "station_id", "event_time", "event_type", "severity",
-                "description", "metadata", "target_station_id", "ingested_at", "batch_id"
+                "description", "metadata", "target_station_id", "created_at", "updated_at"
             ],
             batch_id=f"se_{context['run_id']}",
             cutoff_time=context['data_interval_start'],
@@ -153,9 +153,10 @@ with DAG(
             table=C.STATION_PM,
             pk_column="metric_id",
             target_columns=[
-                "metric_id", "station_id", "metric_time", "cpu_util_pct", 
-                "memory_util_pct", "disk_util_pct", "temperature_c", "active_connections",
-                "throughput_mbps", "uptime_seconds", "error_count", "ingested_at", "batch_id"
+                "metric_id", "station_id", "metric_time", "cpu_usage_pct", 
+                "memory_usage_pct", "disk_usage_pct", "temperature_celsius", "power_consumption_watts",
+                "uplink_throughput_mbps", "downlink_throughput_mbps", "active_subscribers",
+                "signal_strength_dbm", "frequency_band", "channel_utilization_pct", "created_at", "updated_at"
             ],
             batch_id=f"pm_{context['run_id']}",
             cutoff_time=context['data_interval_start'],
