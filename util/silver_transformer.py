@@ -3,11 +3,11 @@ import pandas as pd
 import logging
 from typing import Optional
 
-from station_dags.util.s3_parquet import S3ParquetIO
+from util.s3_parquet import S3ParquetIO
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from station_dags.config.config import PipelineConfig as C
+from telecom_pipeline_etl.config.config import PipelineConfig as C
 import re
 
 logger = logging.getLogger(__name__)

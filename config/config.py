@@ -3,6 +3,9 @@ import os
 class PipelineConfig:
     #TODO: Migrate to use Variables or Params of Airflow
 
+    # config.py
+    TEMP_DIR = os.getenv("AIRFLOW_TEMP_DIR", "/opt/airflow/etl_temp")
+
     POSTGRES_CONN_ID = os.environ.get("POSTGRES_CONN_ID", "postgres-oltp")
     S3_CONN_ID = os.environ.get("MINIO_CONN_ID", "minio_default")
     CLICKHOUSE_CONN_ID = os.environ.get("CLICKHOUSE_CONN_ID", "clickhouse_default")

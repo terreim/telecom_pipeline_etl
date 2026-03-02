@@ -4,6 +4,7 @@ import logging
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from config.config import PipelineConfig as C
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ class S3ParquetIO:
                 yield batch.to_pandas()
 
     def write_parquet(self, df: pd.DataFrame, s3_key: str) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
+        with tempfile.NamedTemporaryFile(dir=C.TEMP_DIR, suffix=".parquet", delete=False) as tmp_file:
             tmp_path = tmp_file.name
         try:
             table_pa = pa.Table.from_pandas(df, preserve_index=False)

@@ -2,8 +2,8 @@ import logging
 from typing import Optional
 import pandas as pd
 
-from station_dags.config.config import PipelineConfig as C
-from station_dags.util.s3_parquet import S3ParquetIO
+from config.config import PipelineConfig as C
+from util.s3_parquet import S3ParquetIO
 
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook

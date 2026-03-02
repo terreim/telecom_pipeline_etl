@@ -3,8 +3,8 @@ from datetime import date, timedelta
 
 import logging
 
-from station_dags.config.config import PipelineConfig as C
-from station_dags.util.s3_parquet import S3ParquetIO
+from config.config import PipelineConfig as C
+from util.s3_parquet import S3ParquetIO
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook

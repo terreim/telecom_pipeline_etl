@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import logging
 
-from station_dags.util.s3_parquet import S3ParquetIO
+from util.s3_parquet import S3ParquetIO
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook

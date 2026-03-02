@@ -19,9 +19,9 @@ from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
 from datetime import datetime, timedelta
 
-from station_dags.config.config import PipelineConfig as C
-from station_dags.util.warehouse_loader import ClickHouseLoader
-from station_dags.util.gold_aggregator import GoldAggregator
+from config.config import PipelineConfig as C
+from util.warehouse_loader import ClickHouseLoader
+from util.gold_aggregator import GoldAggregator
 
 import logging
 log = logging.getLogger(__name__)

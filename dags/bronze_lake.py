@@ -6,9 +6,9 @@ import re
 # from airflow.providers.common.sql.sensors.sql import SqlSensor
 from airflow.sdk.bases.sensor import PokeReturnValue
 from airflow.exceptions import AirflowSkipException
-from station_dags.util.bronze_extractor import BronzeExtractor, PostgresHook
+from util.bronze_extractor import BronzeExtractor, PostgresHook
 
-from station_dags.config.config import PipelineConfig as C
+from config.config import PipelineConfig as C
 
 default_args = {
     "owner": "data-team", 

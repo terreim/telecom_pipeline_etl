@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 from pendulum import now
 import re
 
-from station_dags.config.config import PipelineConfig as C
-from station_dags.util.silver_transformer import SilverTransformer
-from station_dags.bronze_lake import silver_trigger_traffic, silver_trigger_events, silver_trigger_metrics
+from config.config import PipelineConfig as C
+from util.silver_transformer import SilverTransformer
+from bronze_lake import silver_trigger_traffic, silver_trigger_events, silver_trigger_metrics
 
 default_args = {
     "owner": "data-team", 

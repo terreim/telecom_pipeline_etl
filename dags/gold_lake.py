@@ -6,12 +6,12 @@ import json
 
 from pendulum import now as pendulum_now
 
-from station_dags.config.config import PipelineConfig as C
+from config.config import PipelineConfig as C
 
-from station_dags.util.silver_transformer import SilverTransformer
-from station_dags.util.gold_aggregator import GoldAggregator
-from station_dags.util.warehouse_loader import ClickHouseLoader
-from station_dags.silver_lake import staging_trigger_events, staging_trigger_metrics, staging_trigger_traffic
+from util.silver_transformer import SilverTransformer
+from util.gold_aggregator import GoldAggregator
+from util.warehouse_loader import ClickHouseLoader
+from silver_lake import staging_trigger_events, staging_trigger_metrics, staging_trigger_traffic
 
 default_args = {
     "owner": "data-team", 

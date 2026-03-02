@@ -54,6 +54,7 @@ x-airflow-common:
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    AIRFLOW_TEMP_DIR: /opt/airflow/etl_temp
 
     # -------------------------------------------------------------------------
     # Pre-configured Connections (Zero-Config Startup)
@@ -74,6 +75,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - D:\ETL_Temp:/opt/airflow/etl_temp
   user: "${AIRFLOW_UID:-50000}:0"
   networks:
     - pipeline-net
