@@ -1,3 +1,14 @@
+"""
+Define common connections utilities for S3 and Postgres
+
+S3 Connections:
+    get_s3_hook: returns an S3Hook instance for the given connection ID
+    get_s3_credentials: returns the access key, secret key, and endpoint for the given S3 connection ID
+
+Postgres Connections:
+    pg_cursor: a context manager that yields a Postgres connection and cursor, and handles closing/rollback. READ-ONLY.
+"""
+
 from contextlib import contextmanager
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook

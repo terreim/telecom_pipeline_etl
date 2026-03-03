@@ -738,7 +738,6 @@ class GoldAggregator:
     # =========================================================================
 
     def gold_outage_report(self, year: int, month: int, day: int) -> dict:
-        
         target_date = date(year, month, day)
         report_date = target_date.isoformat()
         baseline_start = (target_date - timedelta(days=7)).isoformat()

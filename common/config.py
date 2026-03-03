@@ -1,8 +1,82 @@
+"""
+    PipelineConfig
+
+    A configuration class for managing ETL pipeline settings and database connections.
+    This class serves as a centralized configuration container for a telecommunications
+    data pipeline, managing connection IDs, storage prefixes, table names, and processing
+    parameters across Bronze, Silver, and Gold data layers.
+
+    **Attributes:**
+    Connection Management:
+        - postgres_conn_id (str): Airflow connection ID for PostgreSQL (OLTP database)
+        - s3_conn_id (str): Airflow connection ID for MinIO/S3 storage
+        - clickhouse_conn_id (str): Airflow connection ID for ClickHouse data warehouse
+    
+    Storage Configuration:
+        - minio_endpoint (str): MinIO/S3 endpoint URL
+        - s3_bucket (str): S3 bucket name for data storage
+        - bronze_prefix (str): S3 prefix for raw data layer
+        - silver_prefix (str): S3 prefix for cleaned/processed data layer
+        - gold_prefix (str): S3 prefix for aggregated/business-ready data layer
+        - quarantine_prefix (str): S3 prefix for invalid/problematic data
+    
+    Schema and Dimension:
+        - schema_name (str): Database schema name
+        - dim_dict (str): Dimension table name for station dictionary
+    
+    Table Names (Bronze Layer - Raw):
+        - station_st (str): Subscriber traffic raw table
+        - station_bs (str): Base station raw table
+        - station_pm (str): Performance metrics raw table
+        - station_se (str): Station events raw table
+        - station_cf (str): Configuration raw table
+        - station_lc (str): Location raw table
+        - station_op (str): Operator raw table
+    
+    Table Names (Silver Layer - Cleaned):
+        - station_cleaned_st (str): Subscriber traffic cleaned table
+        - station_cleaned_pm (str): Performance metrics cleaned table
+        - station_cleaned_se (str): Station events cleaned table
+    
+    Table Names (Silver Layer - Staging):
+        - station_staging_st (str): Subscriber traffic staging table
+        - station_staging_pm (str): Performance metrics staging table
+        - station_staging_se (str): Station events staging table
+    
+    Table Names (Gold Layer - Business-Ready):
+        - station_health (str): Station health hourly aggregation
+        - station_slac (str): SLA compliance metrics
+        - station_anomaly (str): Anomaly detection features
+        - station_outage (str): Outage reports
+        - station_region (str): Regional daily metrics
+        - station_maintenance (str): Maintenance reports
+        - station_handover (str): Handover daily metrics
+        - station_alarm (str): Alarm daily metrics
+    
+    Processing Parameters:
+        - temp_dir (str): Temporary directory for staging files during ETL
+        - buffer_seconds (int): Buffer time in seconds for event processing (default: 240)
+        - lookback_hours (int): Historical lookback window in hours (default: 24)
+    
+    **Usage Note:**
+    Use the provided class methods:
+        - `from_env()`: Recommended - Loads configuration from environment variables with sensible defaults
+        - `from_airflow_vars()`: Alternative - Loads from Airflow Variables (not yet implemented)
+    
+    Example:
+        config = PipelineConfig.from_env()
+        
+    The class uses environment variables with fallback defaults, making it suitable for
+    containerized deployments and Airflow DAGs.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from functools import lru_cache
 import os
 
-@dataclass
+@dataclass(frozen=True)
 class PipelineConfig:
     # Temp dir
     temp_dir: str
@@ -22,6 +96,7 @@ class PipelineConfig:
 
     # Schema and table names
     schema_name: str
+    dim_dict: str
 
     # Bronze
     station_st: str
@@ -57,7 +132,8 @@ class PipelineConfig:
     lookback_hours: int = 24
 
     @classmethod
-    def from_env(cls) -> 'PipelineConfig':
+    @lru_cache(maxsize=1)
+    def from_env(cls) -> PipelineConfig:
         return cls(
             temp_dir=os.getenv("AIRFLOW_TEMP_DIR", "/opt/airflow/etl_temp"),
             postgres_conn_id=os.environ.get("POSTGRES_CONN_ID", "postgres-oltp"),
@@ -70,6 +146,7 @@ class PipelineConfig:
             gold_prefix=os.environ.get("GOLD_PREFIX", "gold"),
             quarantine_prefix=os.environ.get("QUARANTINE_PREFIX", "quarantine"),
             schema_name=os.environ.get("SCHEMA_NAME", "telecom"),
+            dim_dict=os.environ.get("DIM_DICT", "dict_station"),
             station_st=os.environ.get("STATION_ST", "subscriber_traffic"),
             station_bs=os.environ.get("STATION_BS", "base_station"),
             station_pm=os.environ.get("STATION_PM", "performance_metrics"),
@@ -94,7 +171,7 @@ class PipelineConfig:
         )
 
     @classmethod
-    def from_airflow_vars(cls) -> 'PipelineConfig':
+    def from_airflow_vars(cls) -> PipelineConfig:
         # This method can be implemented to read from Airflow Variables if needed
         raise NotImplementedError("from_airflow_vars is not implemented yet")
 
@@ -104,4 +181,4 @@ class PipelineConfig:
         assert self.lookback_hours >= 0
         assert self.temp_dir, "TEMP_DIR must not be empty"
 
-
+CFG = PipelineConfig.from_env()

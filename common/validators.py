@@ -420,7 +420,7 @@ def validate_metrics(
         ("power_consumption_watts",  profile.power_range,           "power_invalid"),
         ("uplink_throughput_mbps",   profile.throughput_range,      "uplink_invalid"),
         ("downlink_throughput_mbps", profile.throughput_range,       "downlink_invalid"),
-        ("signal_strength_dbm",     profile.signal_strength_range,  "signal_invalid"),
+        ("signal_strength_dbm",      profile.signal_strength_range,  "signal_invalid"),
         ("channel_utilization_pct",  profile.channel_util_range,    "channel_invalid"),
         # Staging column names (if renaming already happened)
         ("cpu_util_pct",             profile.cpu_range,             "cpu_invalid"),

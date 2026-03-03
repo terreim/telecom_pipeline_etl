@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import logging
 
 from util.s3_parquet import S3ParquetIO
+from config.config import PipelineConfig as C
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -31,10 +32,10 @@ def _get_cursor(pg_hook):
 class BronzeExtractor:
     def __init__(
         self, 
-        postgres_conn_id: str,
-        s3_conn_id: str, 
-        s3_bucket: str, 
-        s3_prefix_base: str
+        postgres_conn_id: str = C.POSTGRES_CONN_ID,
+        s3_conn_id: str = C.S3_CONN_ID, 
+        s3_bucket: str = C.S3_BUCKET, 
+        s3_prefix_base: str = C.BRONZE_PREFIX
     ):
         self.pg_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
         self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)

@@ -111,12 +111,12 @@ class SilverTransformer:
 
         conditions = {}
         
-        if 'cpu_util_pct' in df.columns:
-            conditions['cpu_invalid'] = ~df['cpu_util_pct'].between(0, 100)
-        if 'memory_util_pct' in df.columns:
-            conditions['memory_invalid'] = ~df['memory_util_pct'].between(0, 100)
-        if 'temperature_c' in df.columns:
-            conditions['temp_invalid'] = ~df['temperature_c'].between(-20, 100)
+        if 'cpu_usage_pct' in df.columns:
+            conditions['cpu_invalid'] = ~df['cpu_usage_pct'].between(0, 100)
+        if 'memory_usage_pct' in df.columns:
+            conditions['memory_invalid'] = ~df['memory_usage_pct'].between(0, 100)
+        if 'temperature_celsius ' in df.columns:
+            conditions['temp_invalid'] = ~df['temperature_celsius '].between(-20, 100)
         if 'uptime_seconds' in df.columns:
             conditions['uptime_negative'] = df['uptime_seconds'] < 0
 
@@ -170,8 +170,18 @@ class SilverTransformer:
         df['event_date'] = df['event_time'].dt.date
         df['event_hour'] = df['event_time'].dt.floor('h')
         df['is_high_latency'] = df['latency_ms'] > 100
-        df['processed_at'] = pd.Timestamp.now('UTC')
+        df['transformed_at'] = pd.Timestamp.now('UTC')
         return df
+    
+    def _add_derived_columns_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df['transformed_at'] = pd.Timestamp.now('UTC')
+        return df
+
+    def _add_derived_columns_events(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df['transformed_at'] = pd.Timestamp.now('UTC')
+        return df   
 
     # =========================================================================
     # S3 Operations
@@ -446,7 +456,7 @@ class SilverTransformer:
             silver_subpath=C.STATION_CLEANED_PM,
             validate_fn=self._validate_metrics,
             enrich=True,
-            add_derived_fn=None,
+            add_derived_fn=self._add_derived_columns_metrics,
             year=year,
             month=month,
             day=day,
@@ -461,7 +471,7 @@ class SilverTransformer:
             silver_subpath=C.STATION_CLEANED_SE,
             validate_fn=self._validate_events,
             enrich=True,
-            add_derived_fn=None,
+            add_derived_fn=self._add_derived_columns_events,
             year=year,
             month=month,
             day=day,
