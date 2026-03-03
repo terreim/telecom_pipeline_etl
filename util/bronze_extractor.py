@@ -4,38 +4,28 @@ import json
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from contextlib import contextmanager
 
 import logging
 
 from util.s3_parquet import S3ParquetIO
-from config.config import PipelineConfig as C
+
+from common.config import CFG
+from common.connections import get_s3_hook, pg_cursor
+from common.metadata import MetadataManager
+from common.sql_builder import sql_bronze_extractor
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 logger = logging.getLogger(__name__)
 
-@contextmanager
-def _get_cursor(pg_hook):
-    conn = pg_hook.get_conn()
-    cursor = conn.cursor()
-    try:
-        yield conn, cursor
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
 class BronzeExtractor:
     def __init__(
         self, 
-        postgres_conn_id: str = C.POSTGRES_CONN_ID,
-        s3_conn_id: str = C.S3_CONN_ID, 
-        s3_bucket: str = C.S3_BUCKET, 
-        s3_prefix_base: str = C.BRONZE_PREFIX
+        postgres_conn_id: str = CFG.postgres_conn_id,
+        s3_conn_id: str = CFG.s3_conn_id, 
+        s3_bucket: str = CFG.s3_bucket, 
+        s3_prefix_base: str = CFG.bronze_prefix
     ):
         self.pg_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
         self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)
@@ -117,7 +107,7 @@ class BronzeExtractor:
 
         logger.info(f"Extracting {schema}.{table} | batch_id={batch_id} | cutoff={cutoff_time}")
 
-        with _get_cursor(self.pg_hook) as (conn, cursor):
+        with pg_cursor(self.pg_hook) as (conn, cursor):
             try:
                 cursor.execute(sql, (cutoff_time, batch_limit, batch_id))
 

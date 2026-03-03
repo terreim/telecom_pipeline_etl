@@ -94,12 +94,14 @@ def sql_dim_station() -> str:
 # Bronze layer template
 # ══════════════════════════════════════════════════════════════════════════════
 
-def sql_bronze_extractor(table_name: str, columns: list[str]) -> str:
+def sql_bronze_extractor(table_name: str, columns: list[str], overlap: int, buffer: int, pk_column: str) -> str:
     return f"""
         SELECT {', '.join(columns)}
         FROM {CFG.schema_name}.{table_name}
-        WHERE updated_at > %s AND updated_at <= %s
-        ORDER BY updated_at"""
+        WHERE updated_at > %(nominal_from)s - INTERVAL '{overlap}s'
+            AND updated_at <= %(max_updated_at)s - INTERVAL '{buffer}s'
+        ORDER BY updated_at ASC, {pk_column} ASC
+        """
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Silver staging templates

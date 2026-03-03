@@ -10,19 +10,22 @@ Proposed schema:
     "table": "subscriber_traffic",
     "batch_id": "st_scheduled__2026-03-02T09:00:00+00:00",
     "previous_batch_id": "st_scheduled__2026-03-02T08:59:00+00:00",
-    "dedup_key": ["traffic_id", "updated_at"],
+    "dedup_key": ["traffic_id"],
     "change_detection_column": "updated_at",
     "record_count": 14832,
     "quarantine_count": 0,
+    "loaded_to_warehouse": false,
+    "is_chunked": false,
     "source_watermark": {
         "column": "updated_at",
-        "from": "2026-03-02T08:52:00+00:00",
         "nominal_from": "2026-03-02T08:54:00+00:00",
+        "from": "2026-03-02T08:52:00+00:00",
         "to": "2026-03-02T09:11:00+00:00",
         "buffer_seconds": 90,
         "overlap_seconds": 120
     },
     "observed_delays": {
+        "actual_max_updated_at": "2026-03-02T09:10:58.234+00:00",
         "max_station_propagation_seconds": 18.4,
         "max_clock_offset_seconds": 62.1,
         "p99_station_propagation_seconds": 12.7,
@@ -55,10 +58,14 @@ class MetadataManager:
         """
         try:
             content = self.s3_hook.read_key(bucket=self.s3_bucket, key=prefix)
-            if content is not None:
-                return json.loads(content)
+            if content is None:
+                return None
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Corrupted metadata at {prefix}") from e
         except Exception:
-            return None
+            return None 
+        #TODO: find specifically S3Hook exceptions for "key not found" vs "connection error" and handle accordingly.
     
     def write_metadata(self, prefix: str, metadata_dict: dict):
         """
