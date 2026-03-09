@@ -3,7 +3,7 @@ import pandas as pd
 import logging
 from typing import Optional
 
-from util.s3_parquet import S3ParquetIO
+from telecom_pipeline_etl.common.s3 import S3ParquetIO
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook

@@ -129,7 +129,7 @@ class PipelineConfig:
 
     # Numeric configs
     buffer_seconds: int = 240
-    lookback_hours: int = 24
+    overlap_seconds: int = 24
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -140,7 +140,7 @@ class PipelineConfig:
             s3_conn_id=os.environ.get("MINIO_CONN_ID", "minio_default"),
             clickhouse_conn_id=os.environ.get("CLICKHOUSE_CONN_ID", "clickhouse_default"),
             minio_endpoint=os.environ.get("MINIO_ENDPOINT", "http://minio:9000"),
-            s3_bucket=os.environ.get("S3_BUCKET", "telecom-data"),
+            s3_bucket=os.environ.get("MINIO_BUCKET", "station-lake"),
             bronze_prefix=os.environ.get("BRONZE_PREFIX", "bronze"),
             silver_prefix=os.environ.get("SILVER_PREFIX", "silver"),
             gold_prefix=os.environ.get("GOLD_PREFIX", "gold"),
@@ -178,7 +178,7 @@ class PipelineConfig:
     def __post_init__(self):
         assert self.s3_bucket, "S3_BUCKET must not be empty"
         assert self.buffer_seconds >= 0
-        assert self.lookback_hours >= 0
+        assert self.overlap_seconds >= 0
         assert self.temp_dir, "TEMP_DIR must not be empty"
 
 CFG = PipelineConfig.from_env()

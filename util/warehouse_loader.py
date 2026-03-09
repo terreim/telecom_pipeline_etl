@@ -3,7 +3,7 @@ from typing import Optional
 import pandas as pd
 
 from config.config import PipelineConfig as C
-from util.s3_parquet import S3ParquetIO
+from telecom_pipeline_etl.common.s3 import S3ParquetIO
 
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook

@@ -258,6 +258,7 @@ TRAFFIC_UPDATE_DELAY       = (30, 600)            # seconds after insert before 
 EVENT_ENRICHMENT_PROB      = 0.05     # % of events enriched with additional metadata
 EVENT_ENRICHMENT_DELAY     = (60, 1800)           # seconds after insert before enrichment
 METRIC_RECALIBRATION_PROB  = 0.005    # % of metrics recalibrated (sensor drift correction)
+METRIC_RECALIBRATION_DELAY = (300, 7200)          # seconds after insert before recalibration
 
 # ── Per-station propagation delay (station → client OLTP) ───────────────
 # Consistent per station, determined by density class of location.
@@ -1930,10 +1931,16 @@ CREATE INDEX IF NOT EXISTS idx_cfg_updated_at
 
 -- ── Auto-update trigger for updated_at ────────────────────────────────────
 -- Bumps updated_at on any UPDATE, so watermark-based CDC catches changes.
+-- If the UPDATE statement already provides a new updated_at value (e.g.
+-- backfill corrections with a synthetic timestamp), the trigger respects
+-- it and does NOT overwrite with NOW().
 CREATE OR REPLACE FUNCTION telecom.set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
-    NEW.updated_at = NOW();
+    -- Only auto-stamp when the UPDATE did not explicitly change updated_at
+    IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        NEW.updated_at = NOW();
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -2188,7 +2195,7 @@ def insert_traffic_batch(
     records: list[dict],
     late_arrival_rng: Optional[random.Random] = None,
     is_backfill: bool = False,
-) -> list[int]:
+) -> list[tuple[int, datetime]]:
     """Insert traffic records. Returns list of inserted traffic_ids.
 
     Time model:
@@ -2245,7 +2252,7 @@ def insert_traffic_batch(
 
                 row = cur.fetchone()
                 if row:
-                    inserted_ids.append(row[0])
+                    inserted_ids.append((row[0], created_at))
 
                 # Maybe insert a duplicate (same event_time, slightly different created_at)
                 if late_arrival_rng and late_arrival_rng.random() < DUPLICATE_RECORD_PROB:
@@ -2284,7 +2291,7 @@ def insert_metrics(
     record: dict,
     is_backfill: bool = False,
     rng: Optional[random.Random] = None,
-) -> Optional[int]:
+) -> Optional[tuple[int, datetime]]:
     propagation = record.get("propagation_delay", 2.0)
     metric_time, created_at = _compute_times(
         ref_time=record["metric_time"],
@@ -2316,7 +2323,7 @@ def insert_metrics(
             ))
             row = cur.fetchone()
         conn.commit()
-    return row[0] if row else None
+    return (row[0], created_at) if row else None
 
 
 def insert_event(
@@ -2324,7 +2331,7 @@ def insert_event(
     record: Optional[dict],
     is_backfill: bool = False,
     rng: Optional[random.Random] = None,
-) -> Optional[int]:
+) -> Optional[tuple[int, datetime]]:
     if not record:
         return None
     propagation = record.get("propagation_delay", 2.0)
@@ -2352,46 +2359,69 @@ def insert_event(
             ))
             row = cur.fetchone()
         conn.commit()
-    return row[0] if row else None
+    return (row[0], created_at) if row else None
 
 
 # ── UPDATE simulation — forces ETL to handle row mutations ────────────────
 
 def simulate_traffic_corrections(
     db: DatabaseManager,
-    traffic_ids: list[int],
+    traffic_ids_with_ts: list[tuple[int, datetime]],
     rng: random.Random,
+    correction_time: Optional[datetime] = None,
 ):
     """Simulate CDR corrections: adjust bytes/duration on recently inserted traffic.
-    
+
     In real telecom, the initial CDR is an estimate. After the session fully
     closes, the system reconciles actual byte counts and duration. This UPDATE
     bumps updated_at, forcing the ETL to re-extract and re-process the row.
+
+    Args:
+        traffic_ids_with_ts: List of (traffic_id, created_at) tuples.
+        correction_time: If set (backfill), ignored in favour of per-record
+            created_at + TRAFFIC_UPDATE_DELAY.  Kept for API compat with
+            streaming mode (pass None → uses NOW()).
     """
-    if not traffic_ids:
+    if not traffic_ids_with_ts:
         return 0
 
-    to_correct = [tid for tid in traffic_ids if rng.random() < TRAFFIC_UPDATE_PROB]
+    to_correct = [
+        (tid, ts) for tid, ts in traffic_ids_with_ts
+        if rng.random() < TRAFFIC_UPDATE_PROB
+    ]
     if not to_correct:
         return 0
 
-    # UPDATE uses plain NOW() — client timestamps its own corrections
     corrected = 0
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
-            for tid in to_correct:
-                # CDR correction: adjust bytes by ±5-30%, set final duration
+            for tid, record_created_at in to_correct:
                 bytes_factor = rng.uniform(0.7, 1.3)
                 duration_adjust = rng.randint(-5000, 15000)
-                cur.execute("""
-                    UPDATE telecom.subscriber_traffic
-                    SET bytes_up = GREATEST(0, (bytes_up * %s)::BIGINT),
-                        bytes_down = GREATEST(0, (bytes_down * %s)::BIGINT),
-                        connection_duration_ms = GREATEST(100,
-                            COALESCE(connection_duration_ms, 0) + %s),
-                        updated_at = NOW()
-                    WHERE traffic_id = %s
-                """, (bytes_factor, bytes_factor, duration_adjust, tid))
+                if record_created_at is not None:
+                    # Per-record: updated_at = that row's created_at + delay
+                    ts = record_created_at + timedelta(
+                        seconds=rng.randint(*TRAFFIC_UPDATE_DELAY)
+                    ) + timedelta(seconds=rng.randint(0, 30))
+                    cur.execute("""
+                        UPDATE telecom.subscriber_traffic
+                        SET bytes_up = GREATEST(0, (bytes_up * %s)::BIGINT),
+                            bytes_down = GREATEST(0, (bytes_down * %s)::BIGINT),
+                            connection_duration_ms = GREATEST(100,
+                                COALESCE(connection_duration_ms, 0) + %s),
+                            updated_at = %s
+                        WHERE traffic_id = %s
+                    """, (bytes_factor, bytes_factor, duration_adjust, ts, tid))
+                else:
+                    cur.execute("""
+                        UPDATE telecom.subscriber_traffic
+                        SET bytes_up = GREATEST(0, (bytes_up * %s)::BIGINT),
+                            bytes_down = GREATEST(0, (bytes_down * %s)::BIGINT),
+                            connection_duration_ms = GREATEST(100,
+                                COALESCE(connection_duration_ms, 0) + %s),
+                            updated_at = NOW()
+                        WHERE traffic_id = %s
+                    """, (bytes_factor, bytes_factor, duration_adjust, tid))
                 corrected += 1
         conn.commit()
     return corrected
@@ -2399,22 +2429,30 @@ def simulate_traffic_corrections(
 
 def simulate_event_enrichment(
     db: DatabaseManager,
-    event_ids: list[int],
+    event_ids_with_ts: list[tuple[int, datetime]],
     rng: random.Random,
+    # correction_time: Optional[datetime] = None,
 ):
     """Simulate event metadata enrichment: add root_cause, affected_count, etc.
     
     In real telecom, events initially log with minimal metadata.
     A downstream system later enriches them with correlation analysis.
+
+    Args:
+        event_ids_with_ts: List of (event_id, created_at) tuples.
+        correction_time: If set (backfill), use this as updated_at instead of
+            NOW().  Each enriched row gets its own jittered timestamp. Obsolete — enrichment is now triggered by created_at + delay per record, not a single correction_time.
     """
-    if not event_ids:
+    if not event_ids_with_ts:
         return 0
 
-    to_enrich = [eid for eid in event_ids if rng.random() < EVENT_ENRICHMENT_PROB]
+    to_enrich = [
+        (eid, ts) for eid, ts in event_ids_with_ts
+        if rng.random() < EVENT_ENRICHMENT_PROB
+    ]
     if not to_enrich:
         return 0
 
-    # UPDATE uses plain NOW() — client timestamps its own corrections
     enriched = 0
     root_causes = [
         "hardware_aging", "software_bug", "config_drift", "power_fluctuation",
@@ -2422,19 +2460,31 @@ def simulate_event_enrichment(
     ]
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
-            for eid in to_enrich:
+            for eid, record_created_at in to_enrich:
+                ts = (record_created_at + timedelta(
+                          seconds=rng.randint(*EVENT_ENRICHMENT_DELAY)
+                      ) + timedelta(seconds=rng.randint(0, 60))
+                      if record_created_at is not None else None)
                 enrichment = json.dumps({
                     "root_cause": rng.choice(root_causes),
                     "affected_subscribers": rng.randint(0, 500),
                     "correlated_alarms": rng.randint(0, 10),
-                    "enriched_at": datetime.now(timezone.utc).isoformat(),
+                    "enriched_at": (ts or datetime.now(timezone.utc)).isoformat(),
                 })
-                cur.execute("""
-                    UPDATE telecom.station_events
-                    SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE event_id = %s
-                """, (enrichment, eid))
+                if ts is not None:
+                    cur.execute("""
+                        UPDATE telecom.station_events
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                            updated_at = %s
+                        WHERE event_id = %s
+                    """, (enrichment, ts, eid))
+                else:
+                    cur.execute("""
+                        UPDATE telecom.station_events
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE event_id = %s
+                    """, (enrichment, eid))
                 enriched += 1
         conn.commit()
     return enriched
@@ -2442,37 +2492,58 @@ def simulate_event_enrichment(
 
 def simulate_metric_recalibration(
     db: DatabaseManager,
-    metric_ids: list[int],
+    metric_ids_with_ts: list[tuple[int, datetime]],
     rng: random.Random,
+    correction_time: Optional[datetime] = None,
 ):
     """Simulate sensor recalibration: adjust temperature/CPU readings.
     
     Sensors drift over time. After periodic calibration, recent readings
     are retroactively adjusted. Typically affects temperature and signal.
+
+    Args:
+        correction_time: If set (backfill), use this as updated_at instead of
+            NOW().  Each recalibrated row gets its own jittered timestamp.
     """
-    if not metric_ids:
+    if not metric_ids_with_ts:
         return 0
 
-    to_recalibrate = [mid for mid in metric_ids if rng.random() < METRIC_RECALIBRATION_PROB]
+    to_recalibrate = [
+        (mid, ts) for mid, ts in metric_ids_with_ts
+        if rng.random() < METRIC_RECALIBRATION_PROB
+    ]
     if not to_recalibrate:
         return 0
 
-    # UPDATE uses plain NOW() — client timestamps its own corrections
     recalibrated = 0
     with _pg_conn(db) as conn:
         with conn.cursor() as cur:
-            for mid in to_recalibrate:
+            for mid, record_created_at in to_recalibrate:
                 temp_offset = rng.uniform(-3.0, 3.0)
                 signal_offset = rng.uniform(-2.0, 2.0)
-                cur.execute("""
-                    UPDATE telecom.performance_metrics
-                    SET temperature_celsius = GREATEST(15,
-                            LEAST(95, temperature_celsius + %s)),
-                        signal_strength_dbm = GREATEST(-120,
-                            LEAST(-30, signal_strength_dbm + %s)),
-                        updated_at = NOW()
-                    WHERE metric_id = %s
-                """, (temp_offset, signal_offset, mid))
+                if correction_time is not None:
+                    ts = record_created_at + timedelta(
+                        seconds=rng.randint(*METRIC_RECALIBRATION_DELAY)
+                    ) + timedelta(seconds=rng.randint(0, 30))
+                    cur.execute("""
+                        UPDATE telecom.performance_metrics
+                        SET temperature_celsius = GREATEST(15,
+                                LEAST(95, temperature_celsius + %s)),
+                            signal_strength_dbm = GREATEST(-120,
+                                LEAST(-30, signal_strength_dbm + %s)),
+                            updated_at = %s
+                        WHERE metric_id = %s
+                    """, (temp_offset, signal_offset, ts, mid))
+                else:
+                    cur.execute("""
+                        UPDATE telecom.performance_metrics
+                        SET temperature_celsius = GREATEST(15,
+                                LEAST(95, temperature_celsius + %s)),
+                            signal_strength_dbm = GREATEST(-120,
+                                LEAST(-30, signal_strength_dbm + %s)),
+                            updated_at = NOW()
+                        WHERE metric_id = %s
+                    """, (temp_offset, signal_offset, mid))
                 recalibrated += 1
         conn.commit()
     return recalibrated
@@ -3341,9 +3412,9 @@ def run_backfill(
                     evt_time = hour_start + timedelta(seconds=rng.randint(0, 3599))
                     ev = generate_station_event(station, stations, evt_time, rng)
                     if ev:
-                        eid = _bf_insert_event(db, ev)
-                        if eid:
-                            pending_event_ids.append(eid)
+                        result = _bf_insert_event(db, ev)
+                        if result:
+                            pending_event_ids.append(result)
                         day_events += 1
 
                 # ── Metrics ────────────────────────────────────────────────
@@ -3352,20 +3423,26 @@ def run_backfill(
                     if s["current_station"] == station.station_code
                 )
                 metrics = generate_performance_metrics(station, hour_start, active_count, rng)
-                mid = _bf_insert_metrics(db, metrics)
-                if mid:
-                    pending_metric_ids.append(mid)
+                result = _bf_insert_metrics(db, metrics)
+                if result:
+                    pending_metric_ids.append(result)
                 total_metrics += 1
 
             # Flush traffic
             if traffic_buffer:
-                ids = _bf_insert_traffic(db, traffic_buffer, rng)
-                pending_traffic_ids.extend(ids)
+                id_ts_pairs = _bf_insert_traffic(db, traffic_buffer, rng)
+                pending_traffic_ids.extend(id_ts_pairs)
                 day_traffic += len(traffic_buffer)
                 traffic_buffer.clear()
 
             # ── End-of-hour: simulate UPDATE corrections ──────────────
+            # In backfill, compute a realistic correction_time using the
+            # delay constants so that updated_at lands a few minutes/hours
+            # after the original created_at, not at TODAY's wall clock.
+            # Base on hour_end (not hour_start) because records have
+            # created_at values spread across the full hour + propagation.
             hour_updates = 0
+            hour_end = hour_start + timedelta(hours=1)
             hour_updates += simulate_traffic_corrections(db, pending_traffic_ids, rng)
             hour_updates += simulate_event_enrichment(db, pending_event_ids, rng)
             hour_updates += simulate_metric_recalibration(db, pending_metric_ids, rng)

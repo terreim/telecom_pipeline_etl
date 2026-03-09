@@ -372,6 +372,12 @@ def validate_traffic(
     if "imsi_hash" in df.columns:
         conditions["imsi_null"] = df["imsi_hash"].isnull() | (df["imsi_hash"] == "")
 
+    # Created_at/updated_at timestamps
+    if "created_at" in df.columns and "updated_at" in df.columns:
+        created = _normalize_event_time(df["created_at"], profile.timezone_source)
+        updated = _normalize_event_time(df["updated_at"], profile.timezone_source)
+        conditions["updated_before_created"] = updated < created
+
     # ── Compose ────────────────────────────────────────────────────────
     df["is_valid"] = ~pd.concat(conditions.values(), axis=1).any(axis=1)
     df["quality_issues"] = _build_quality_string(conditions, len(df))

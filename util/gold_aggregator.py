@@ -4,7 +4,7 @@ from datetime import date, timedelta
 import logging
 
 from config.config import PipelineConfig as C
-from util.s3_parquet import S3ParquetIO
+from telecom_pipeline_etl.common.s3 import S3ParquetIO
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook

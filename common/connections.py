@@ -29,6 +29,9 @@ def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
 
     return (s3_access_key, s3_secret_key, s3_endpoint)
 
+def get_postgres_hook(conn_id: str) -> PostgresHook:
+    return PostgresHook(postgres_conn_id=conn_id)
+
 @contextmanager
 def pg_cursor(pg_hook: PostgresHook):
     conn = pg_hook.get_conn()

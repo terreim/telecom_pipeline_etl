@@ -1,83 +1,65 @@
 """
 Manages metadata for ELT batches, storing and retrieving JSON metadata files in S3.
 Each metadata file corresponds to an hour-partition of a specific table in bronze/silver/gold.
-
-Proposed schema:
-`{
-    "schema_version": 1,
-    "status": "complete",
-    "layer": "bronze",
-    "table": "subscriber_traffic",
-    "batch_id": "st_scheduled__2026-03-02T09:00:00+00:00",
-    "previous_batch_id": "st_scheduled__2026-03-02T08:59:00+00:00",
-    "dedup_key": ["traffic_id"],
-    "change_detection_column": "updated_at",
-    "record_count": 14832,
-    "quarantine_count": 0,
-    "loaded_to_warehouse": false,
-    "is_chunked": false,
-    "source_watermark": {
-        "column": "updated_at",
-        "nominal_from": "2026-03-02T08:54:00+00:00",
-        "from": "2026-03-02T08:52:00+00:00",
-        "to": "2026-03-02T09:11:00+00:00",
-        "buffer_seconds": 90,
-        "overlap_seconds": 120
-    },
-    "observed_delays": {
-        "actual_max_updated_at": "2026-03-02T09:10:58.234+00:00",
-        "max_station_propagation_seconds": 18.4,
-        "max_clock_offset_seconds": 62.1,
-        "p99_station_propagation_seconds": 12.7,
-        "p99_clock_offset_seconds": 61.3,
-        "late_arrival_count": 43,
-        "update_count": 127
-    },
-    "data_keys": [
-        "bronze/subscriber_traffic/year=2026/month=03/day=02/hour=09/st_scheduled__2026-03-02T09:00:00+00:00.parquet"
-    ],
-    "created_at": "2026-03-02T09:15:23+00:00",
-    "processing_duration_seconds": 12.4
-}`
 """
 
 import json
-import common.connections as connections
+import logging
+from common.connections import get_s3_hook
 from common.config import CFG
 
+# logger = logging.getLogger(__name__)
 
 class MetadataManager:
     def __init__(self, s3_bucket: str, conn_id: str = CFG.s3_conn_id):
-        self.s3_hook = connections.get_s3_hook(conn_id=conn_id)
+        self.s3_hook = get_s3_hook(conn_id=conn_id)
         self.s3_bucket = s3_bucket
 
-    def read_metadata(self, prefix: str) -> dict:
+    @staticmethod
+    def _is_not_found(e: Exception) -> bool:
+        msg = str(e).lower()
+        return "nosuchkey" in msg or "404" in msg or "not found" in msg
+
+    def check_metadata_exists(self, prefix: str) -> bool:
+        keys = self.s3_hook.list_keys(bucket_name=self.s3_bucket, prefix=prefix) or []
+        return any(k.endswith('.json') for k in keys)
+
+    def read_metadata(self, key: str) -> dict | None:
         """
-        Reads metadata content from S3. Returns the content as a dict.
-        If the key does not exist, returns None.
+        Reads metadata from S3. Returns None only if the key genuinely does not exist.
+        Raises on network errors, permission errors, or corrupted JSON; callers
+        must not interpret those as first-run signals.
         """
         try:
-            content = self.s3_hook.read_key(bucket=self.s3_bucket, key=prefix)
-            if content is None:
+            content = self.s3_hook.read_key(bucket=self.s3_bucket, key=key)
+        except Exception as e:
+            if self._is_not_found(e):
                 return None
+            raise
+
+        if content is None:
+            return None
+
+        try:
             return json.loads(content)
         except json.JSONDecodeError as e:
-            raise ValueError(f"Corrupted metadata at {prefix}") from e
-        except Exception:
-            return None 
-        #TODO: find specifically S3Hook exceptions for "key not found" vs "connection error" and handle accordingly.
+            raise ValueError(f"Corrupted metadata at s3://{self.s3_bucket}/{key}") from e
     
-    def write_metadata(self, prefix: str, metadata_dict: dict):
+    def write_metadata(self, key: str, metadata_dict: dict) -> None:
         """
-        Writes metadata content to S3 in JSON. 
-        If the key already exists, it will be overwritten since Lake was 
-        configured with versioning enabled, but prefix has timestamp included anyway.
+        Writes metadata to S3 as JSON.
+        Bucket versioning preserves history on overwrite.
         """
-        try:
-            self.s3_hook.load_string(
-                string_data=json.dumps(metadata_dict, indent=2),
-                bucket=self.s3_bucket,
-                key=prefix
-            )
-        except Exception:
-            raise
+        self.s3_hook.load_string(
+            string_data=json.dumps(metadata_dict, indent=2, default=str),
+            bucket_name=self.s3_bucket,
+            key=key,
+            replace=True,
+        )
+    
+    def build_metadata(self, base: dict, **overrides) -> dict:
+        """
+        Merges base dict with overrides. Overrides win on key collision.
+        Stateless — callers own their base dicts.
+        """
+        return {**base, **overrides}

@@ -53,13 +53,12 @@ class BronzeDag(DagFactory):
         
             @task(outlets=outlets)
             def ingest(**context):
-                return self.extractor.el(
+                return self.extractor.extract_bronze(
                     schema=CFG.schema_name,
                     table=table,
                     pk_column=pk_column,
                     target_columns=target_columns,
-                    batch_id=f"st_{context['run_id']}",
-                    cutoff_time=context['data_interval_start'],
+                    batch_id=f"{table[:2]}_{context['run_id']}",
                     time_column=time_column,
                 )
             
@@ -67,6 +66,7 @@ class BronzeDag(DagFactory):
 
     def create_bronze_signal(
             self,
+            table: str,
             outlets: list[str],
             boundary_type: str = 'hourly'
         ) -> Callable:
@@ -76,7 +76,7 @@ class BronzeDag(DagFactory):
             interval_end = context['data_interval_end']
 
             if re.match(r"manual__", context['run_id']):
-                return {"station_events_manual_run": True}
+                return {f"{table}_manual_run": True}
             
             if boundary_type == 'hourly':
                 if interval_end.minute != 0:
@@ -90,3 +90,12 @@ class BronzeDag(DagFactory):
                 return {"day_completed": interval_end.subtract(days=1).day}
             
         return signal
+
+class SilverDag(DagFactory):
+    pass
+
+class GoldDag(DagFactory):
+    pass
+
+class RecoveryDag(DagFactory):
+    pass

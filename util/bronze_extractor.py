@@ -1,23 +1,33 @@
 import os
 import tempfile
-import json
+from datetime import datetime, timedelta
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dataclasses import dataclass, field
 
 import logging
 
-from util.s3_parquet import S3ParquetIO
-
+from common.s3 import S3IO
+from common.metadata_template import metadata_template
 from common.config import CFG
-from common.connections import get_s3_hook, pg_cursor
+from common.schema import unify_schema, serialize_jsonb_columns
+from common.connections import get_postgres_hook, pg_cursor
 from common.metadata import MetadataManager
+from common.watermark import S3WatermarkStore
 from common.sql_builder import sql_bronze_extractor
 
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
 logger = logging.getLogger(__name__)
+
+@dataclass
+class DelayAccumulator:
+    max_updated_at: datetime | None = None
+    max_propagation_s: float = 0.0      # max(created_at - event_time)
+    max_clock_offset_s: float = 0.0     # max(updated_at - created_at)
+    propagation_values: list = field(default_factory=list)  # for p99
+    clock_offset_values: list = field(default_factory=list) # for p99
+    late_arrival_count: int = 0         # created_at - event_time > threshold
+    update_count: int = 0              # updated_at != created_at (beyond threshold)
 
 class BronzeExtractor:
     def __init__(
@@ -25,47 +35,129 @@ class BronzeExtractor:
         postgres_conn_id: str = CFG.postgres_conn_id,
         s3_conn_id: str = CFG.s3_conn_id, 
         s3_bucket: str = CFG.s3_bucket, 
-        s3_prefix_base: str = CFG.bronze_prefix
+        zone: str = CFG.bronze_prefix
     ):
-        self.pg_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
-        self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)
-        self.s3_io = S3ParquetIO(self.s3_hook, s3_bucket)
+        self.pg_hook = get_postgres_hook(postgres_conn_id=postgres_conn_id)
+        self.s3_io = S3IO(conn_id=s3_conn_id, bucket=s3_bucket)
+        self.meta = MetadataManager(s3_bucket, conn_id=s3_conn_id)
+        self.watermark_store = S3WatermarkStore(self.meta)
         self.bucket = s3_bucket
-        self.prefix_base = s3_prefix_base
+        self.zone = zone
 
-    def _build_s3_key(self, table: str, cutoff_time, batch_id: str) -> str:
-        return (
-            f"{self.prefix_base}/"
-            f"{table}/"
-            f"year={cutoff_time.year:04d}/"
-            f"month={cutoff_time.month:02d}/"
-            f"day={cutoff_time.day:02d}/"
-            f"hour={cutoff_time.hour:02d}/"
-            f"batch_id={batch_id}.parquet"
-        )
-    
-    def _ensure_bucket(self):
-        self.s3_io.ensure_bucket()
+    def _get_initial_watermark(self, schema: str, table: str) -> datetime | None:
+        sql = f"SELECT min(updated_at) FROM {schema}.{table}"
+        with pg_cursor(self.pg_hook) as (conn, cur):
+            cur.execute(sql)
+            row = cur.fetchone()
+            conn.commit()
+            return row[0] if row and row[0] else None
 
-    def _unify_schema(self, pyarrow_schema: pa.Schema) -> pa.Schema:
-        """Normalize decimal precisions to max(38,s) so chunks never conflict."""
-        fields = []
-        for field in pyarrow_schema:
-            if pa.types.is_decimal(field.type):
-                # Widen to max precision, keep original scale
-                fields.append(pa.field(field.name, pa.decimal128(38, field.type.scale), nullable=True))
-            else:
-                fields.append(pa.field(field.name, field.type, nullable=True))
-        return pa.schema(fields)
-            
-    def _serialize_jsonb_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Serialize any dict/JSONB columns to JSON strings."""
-        for col in df.columns:
-            if df[col].apply(lambda x: isinstance(x, dict)).any():
-                df[col] = df[col].apply(
-                    lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
-                )
-        return df
+    def _accumulate_delays(
+            self, 
+            acc: DelayAccumulator, 
+            df: pd.DataFrame,
+            time_column: str | None, 
+            buffer_seconds: int) -> None:
+        
+        if 'updated_at' not in df.columns or 'created_at' not in df.columns:
+            return
+        
+        ua = pd.to_datetime(df['updated_at'])
+        ca = pd.to_datetime(df['created_at'])
+
+        chunk_max = ua.max()
+        if acc.max_updated_at is None or chunk_max > acc.max_updated_at:
+            acc.max_updated_at = chunk_max
+
+        if time_column and time_column in df.columns:
+            et = pd.to_datetime(df[time_column], errors='coerce')
+            prop = (ca - et).dt.total_seconds()
+            acc.max_propagation_s = max(acc.max_propagation_s, prop.max())
+            acc.propagation_values.extend(prop.dropna().tolist())
+            acc.late_arrival_count += int((prop > buffer_seconds).sum())
+        
+        offset = (ua - ca).dt.total_seconds()
+        acc.max_clock_offset_s = max(acc.max_clock_offset_s, offset.max())
+        acc.clock_offset_values.extend(offset.dropna().tolist())
+        acc.update_count += int((offset > 1.0).sum())
+
+    def _finalize_delays(self, acc: DelayAccumulator) -> dict:
+        return {
+            "actual_max_updated_at": acc.max_updated_at.isoformat() if acc.max_updated_at else None,
+            "max_station_propagation_seconds": round(acc.max_propagation_s, 1),
+            "max_clock_offset_seconds": round(acc.max_clock_offset_s, 1),
+            "p99_station_propagation_seconds": round(
+                pd.Series(acc.propagation_values).quantile(0.99), 1
+            ) if acc.propagation_values else 0.0,
+            "p99_clock_offset_seconds": round(
+                pd.Series(acc.clock_offset_values).quantile(0.99), 1
+            ) if acc.clock_offset_values else 0.0,
+            "late_arrival_count": acc.late_arrival_count,
+            "update_count": acc.update_count,
+        }
+
+    def extract_bronze(
+            self,
+            table: str,
+            schema: str,
+            pk_column: str,
+            target_columns: list,
+            batch_id: str,
+            time_column: str
+        ):
+        """
+        Iteratively extract bronze data from Postgres to S3, advancing the
+        watermark each iteration until we've caught up to "now - buffer".
+        """
+        windows_processed = 0
+        initial_wm = self._get_initial_watermark(schema, table)
+
+        while True:
+            meta = metadata_template()
+            meta |= {"layer": "bronze", "table": table, "batch_id": batch_id, "dedup_key": [pk_column]}
+
+            fr, n_fr, to, first, prev_bid = self.watermark_store.get_watermark(
+                zone=self.zone,
+                table=table,
+                elt_now=datetime.utcnow(),
+                buffer_seconds=CFG.buffer_seconds,
+                overlap_seconds=CFG.overlap_seconds,
+                initial_watermark=initial_wm,
+            )
+
+            if fr >= datetime.utcnow() - timedelta(seconds=CFG.buffer_seconds):
+                logger.info(f"Watermark caught up for {schema}.{table}, stopping.")
+                break
+
+            meta["previous_batch_id"] = prev_bid
+            meta["source_watermark"] = self.watermark_store.build_watermark(fr, n_fr, to, CFG.buffer_seconds, 0 if first else CFG.overlap_seconds)
+
+            el_result = self.el(
+                schema=schema,
+                table=table,
+                pk_column=pk_column,
+                target_columns=target_columns,
+                batch_id=batch_id,
+                fr=fr,
+                to=to,
+                time_column=time_column,
+            )
+
+            meta |= el_result 
+            meta["created_at"] = datetime.utcnow().isoformat()
+            self.watermark_store.set_watermark(
+                zone=self.zone,
+                table=table,
+                metadata=meta,
+            )
+
+            windows_processed += 1
+
+            if el_result.get("status") == "skipped":
+                break
+        
+        return {"status": "backfill_complete" if windows_processed > 1 else "complete", 
+                    "windows_processed": windows_processed}
 
     def el(
         self,
@@ -74,47 +166,36 @@ class BronzeExtractor:
         pk_column: str,
         target_columns: list,
         batch_id: str,
-        cutoff_time,
+        fr,
+        to,
         batch_limit: int = 70000,
         chunk_size: int = 2000,
         time_column: str | None = None,
     ) -> dict | list[dict]:
         """Extract-Load from Postgres to S3 as Parquet.
 
-        When *time_column* is provided, records are partitioned by their
-        actual event/metric hour instead of the extraction *cutoff_time*.
-        This produces correct bronze partitions for backfilled data.
-        Returns a **list** of result dicts (one per hour) when
-        *time_column* is set; a single dict otherwise.
-        """
-        
-        cols_formatted = ", ".join([f"t.{col}" for col in target_columns])
-
-        sql = f"""
-            WITH batch AS (
-                SELECT {pk_column}
-                FROM {schema}.{table}
-                WHERE extracted_at IS NULL and ingested_at < %s
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE {schema}.{table} t
-            SET extracted_at = NOW(), batch_id = %s
-            FROM batch b
-            WHERE t.{pk_column} = b.{pk_column}
-            RETURNING {cols_formatted}
+        If *time_column* is provided, it will be used for event-time partitioning
+        into hourly Parquet files. Records with NULL/unparseable *time_column* will
+        be placed in the cutoff_time's hour partition as a fallback. If not provided,
+        all records will be placed in a single Parquet file.
         """
 
-        logger.info(f"Extracting {schema}.{table} | batch_id={batch_id} | cutoff={cutoff_time}")
+        sql = sql_bronze_extractor(
+            table=table,
+            columns=target_columns,
+            overlap=CFG.overlap_seconds,
+            buffer=CFG.buffer_seconds,
+            pk_column=pk_column,
+        )
 
         with pg_cursor(self.pg_hook) as (conn, cursor):
             try:
-                cursor.execute(sql, (cutoff_time, batch_limit, batch_id))
+                cursor.execute(sql, {"nominal_from": fr, "max_updated_at": to})
 
                 if not cursor.description:
                     conn.commit()
                     logger.info(f"No data to extract from {schema}.{table}")
-                    result = {"batch_id": batch_id, "count": 0, "status": "skipped"}
+                    result = {"batch_id": batch_id, "record_count": 0, "status": "skipped"}
                     return [result] if time_column else result
                 
                 columns = [desc[0] for desc in cursor.description]
@@ -122,12 +203,12 @@ class BronzeExtractor:
                 if time_column:
                     return self._el_partitioned(
                         conn, cursor, columns, table, batch_id,
-                        cutoff_time, chunk_size, time_column,
+                        fr, chunk_size, time_column,
                     )
                 else:
                     return self._el_single(
                         conn, cursor, columns, table, batch_id,
-                        cutoff_time, chunk_size,
+                        fr, chunk_size,
                     )
             except Exception as e:
                 logger.error(f"Error during extraction process: {e}")
@@ -140,6 +221,7 @@ class BronzeExtractor:
         self, conn, cursor, columns, table, batch_id, cutoff_time, chunk_size,
     ) -> dict:
         total_rows = 0
+        acc = DelayAccumulator()
 
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
             tmp_path = tmp_file.name
@@ -152,14 +234,16 @@ class BronzeExtractor:
                 records = cursor.fetchmany(chunk_size)
                 if not records:
                     break
-
                 df = pd.DataFrame(records, columns=columns)
-                df = self._serialize_jsonb_columns(df)
-
+                
+                self._accumulate_delays(acc, df, None, CFG.buffer_seconds)
+                
+                df = serialize_jsonb_columns(df)
+                
                 table_pa = pa.Table.from_pandas(df, preserve_index=False)
 
                 if writer is None:
-                    parquet_schema = self._unify_schema(table_pa.schema)
+                    parquet_schema = unify_schema(table_pa.schema)
                     writer = pq.ParquetWriter(tmp_path, parquet_schema, compression="SNAPPY")
 
                 table_pa = table_pa.cast(parquet_schema)
@@ -168,29 +252,38 @@ class BronzeExtractor:
 
                 del df, records, table_pa
             
+            observed = self._finalize_delays(acc)
+
             if writer:
                 writer.close()
             
             if total_rows == 0:
                 conn.commit()
                 logger.info(f"No records extracted from {table}.")
-                return {"batch_id": batch_id, "count": 0, "status": "skipped"}
+                return {
+                    "status": "skipped",
+                    "record_count": 0, 
+                    "data_keys": [],
+                    "observed_delays": observed
+                }
             
-            s3_key = self._build_s3_key(table, cutoff_time, batch_id)
-            self._ensure_bucket()
+            is_chunked = total_rows > chunk_size
+            
+            s3_key = self.s3_io.create_key(prefix=self.zone, table=table, cutoff_time=cutoff_time, filename=f"{batch_id}.parquet", type="key")
+            self.s3_io.ensure_bucket()
 
-            self.s3_hook.load_file(
-                filename=tmp_path,
-                key=s3_key,
-                bucket_name=self.bucket,
-                replace=True,
-            )
+            self.s3_io.upload_parquet(tmp_path, s3_key)
 
             conn.commit()
             logger.info(f"Success: {total_rows} rows → s3://{self.bucket}/{s3_key}")
             
-            return {"batch_id": batch_id, "count": total_rows, "status": "success", "s3_key": s3_key}
-        
+            return {
+                    "status": "bronze_complete",
+                    "record_count": total_rows,
+                    "data_keys": [s3_key],
+                    "is_chunked": is_chunked,
+                    "observed_delays": observed
+                }
         except Exception as e:
             conn.rollback()
             logger.error(f"Failed extracting {table}: {e}")
@@ -214,6 +307,7 @@ class BronzeExtractor:
         """
         writers: dict[tuple, dict] = {}   # (y,m,d,h) → {writer, tmp_path, schema, count}
         tmp_paths: list[str] = []
+        acc = DelayAccumulator()
 
         try:
             while True:
@@ -222,7 +316,10 @@ class BronzeExtractor:
                     break
 
                 df = pd.DataFrame(records, columns=columns)
-                df = self._serialize_jsonb_columns(df)
+
+                self._accumulate_delays(acc, df, time_column, CFG.buffer_seconds)
+
+                df = serialize_jsonb_columns(df)
 
                 # Determine partition hour from the time column
                 ts = pd.to_datetime(df[time_column], errors='coerce')
@@ -245,7 +342,7 @@ class BronzeExtractor:
                         tmp_path = tmp_file.name
                         tmp_file.close()
                         tmp_paths.append(tmp_path)
-                        parquet_schema = self._unify_schema(table_pa.schema)
+                        parquet_schema = unify_schema(table_pa.schema)
                         writers[key] = {
                             'writer': pq.ParquetWriter(tmp_path, parquet_schema, compression="SNAPPY"),
                             'tmp_path': tmp_path,
@@ -260,6 +357,8 @@ class BronzeExtractor:
 
                 del df, records
 
+            observed = self._finalize_delays(acc)
+
             # Close all writers
             for entry in writers.values():
                 entry['writer'].close()
@@ -267,38 +366,45 @@ class BronzeExtractor:
             if not writers:
                 conn.commit()
                 logger.info(f"No records extracted from {table}.")
-                return [{"batch_id": batch_id, "count": 0, "status": "skipped"}]
+                return {
+                        "status": "skipped",
+                        "record_count": 0,
+                        "data_keys": [],
+                        "observed_delays": observed
+                    }
+                
 
             # Upload each hour partition
-            self._ensure_bucket()
+            self.s3_io.ensure_bucket()
             results: list[dict] = []
 
             for (y, m, d, h), entry in writers.items():
                 partition_ts = pd.Timestamp(year=y, month=m, day=d, hour=h)
-                s3_key = self._build_s3_key(table, partition_ts, batch_id)
+                s3_key = self.s3_io.create_key(prefix=self.zone, table=table, cutoff_time=partition_ts, filename=f"{batch_id}.parquet", type="key")
 
-                self.s3_hook.load_file(
-                    filename=entry['tmp_path'],
-                    key=s3_key,
-                    bucket_name=self.bucket,
-                    replace=True,
-                )
+                self.s3_io.upload_parquet(entry['tmp_path'], s3_key)
 
                 logger.info(
                     f"Success: {entry['count']} rows "
                     f"→ s3://{self.bucket}/{s3_key}"
                 )
                 results.append({
-                    "batch_id": batch_id,
-                    "count": entry['count'],
-                    "status": "success",
+                    "status": "bronze_complete",
+                    "record_count": entry['count'],
                     "s3_key": s3_key,
+                    "observed_delays": observed
                 })
 
             conn.commit()
-            total = sum(r['count'] for r in results)
+            total = sum(r['record_count'] for r in results)
             logger.info(f"Partitioned {total} rows across {len(results)} hour(s)")
-            return results
+            return {
+                "status": "bronze_complete",
+                "record_count": total,
+                "data_keys": [r['s3_key'] for r in results],
+                "is_chunked": len(writers) > 1,
+                "observed_delays": observed
+            }
 
         except Exception as e:
             conn.rollback()
