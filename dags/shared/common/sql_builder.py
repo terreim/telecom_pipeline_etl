@@ -66,7 +66,7 @@ Functions:
         with alarm rate per active hour and correlation to health scores."""
 
 from datetime import date, timedelta
-from common.config import CFG
+from shared.common.config import CFG
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Dimension template

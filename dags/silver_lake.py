@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 from pendulum import now
 import re
 
-from config.config import PipelineConfig as C
-from util.silver_transformer import SilverTransformer
+from shared.common.config import CFG
+from shared.util.silver_transformer import SilverTransformer
 from bronze_lake import silver_trigger_traffic, silver_trigger_events, silver_trigger_metrics
 
 default_args = {
@@ -36,19 +36,19 @@ with DAG(
     
     @task
     def clean_subscribers_traffic(**context):
-        transformer = SilverTransformer(postgres_conn_id=C.POSTGRES_CONN_ID)
+        transformer = SilverTransformer(postgres_conn_id=CFG.POSTGRES_CONN_ID)
         is_manual = context['run_id'].startswith('manual__')
 
         pending_hours = transformer.find_unprocessed_hours(
-            bronze_table=C.STATION_ST,
-            silver_subpath=C.STATION_CLEANED_ST,
+            bronze_table=CFG.STATION_ST,
+            silver_subpath=CFG.STATION_CLEANED_ST,
             lookback_hours=720,
         )
 
         results = []
         for year, month, day, hour in pending_hours:
             result = transformer.transform_traffic(
-                table_name=C.STATION_ST,
+                table_name=CFG.STATION_ST,
                 year=year, month=month, day=day, hour=hour,
                 batch_id=f"st_{context['run_id']}",
                 manual_run=is_manual,
@@ -83,19 +83,19 @@ with DAG(
     
     @task
     def clean_performance_metrics(**context):
-        transformer = SilverTransformer(postgres_conn_id=C.POSTGRES_CONN_ID)
+        transformer = SilverTransformer(postgres_conn_id=CFG.POSTGRES_CONN_ID)
         is_manual = context['run_id'].startswith('manual__')
 
         pending_hours = transformer.find_unprocessed_hours(
-            bronze_table=C.STATION_PM,
-            silver_subpath=C.STATION_CLEANED_PM,
+            bronze_table=CFG.STATION_PM,
+            silver_subpath=CFG.STATION_CLEANED_PM,
             lookback_hours=720,
         )
 
         results = []
         for year, month, day, hour in pending_hours:
             result = transformer.transform_metrics(
-                table_name=C.STATION_PM,
+                table_name=CFG.STATION_PM,
                 year=year, month=month, day=day, hour=hour,
                 batch_id=f"pm_{context['run_id']}",
                 manual_run=is_manual,
@@ -130,19 +130,19 @@ with DAG(
     
     @task
     def clean_station_events(**context):
-        transformer = SilverTransformer(postgres_conn_id=C.POSTGRES_CONN_ID)
+        transformer = SilverTransformer(postgres_conn_id=CFG.POSTGRES_CONN_ID)
         is_manual = context['run_id'].startswith('manual__')
 
         pending_hours = transformer.find_unprocessed_hours(
-            bronze_table=C.STATION_SE,
-            silver_subpath=C.STATION_CLEANED_SE,
+            bronze_table=CFG.STATION_SE,
+            silver_subpath=CFG.STATION_CLEANED_SE,
             lookback_hours=720,
         )
 
         results = []
         for year, month, day, hour in pending_hours:
             result = transformer.transform_events(
-                table_name=C.STATION_SE,
+                table_name=CFG.STATION_SE,
                 year=year, month=month, day=day, hour=hour,
                 batch_id=f"se_{context['run_id']}",
                 manual_run=is_manual,

@@ -3,8 +3,8 @@ from datetime import date, timedelta
 
 import logging
 
-from config.config import PipelineConfig as C
-from telecom_pipeline_etl.common.s3 import S3ParquetIO
+from shared.common.config import CFG
+from shared.common.s3 import S3IO
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 class GoldAggregator:
     def __init__(
         self, 
-        s3_conn_id: str = C.S3_CONN_ID, 
-        ch_conn_id: str = C.CLICKHOUSE_CONN_ID,
-        s3_bucket: str = C.S3_BUCKET
+        s3_conn_id: str = CFG.s3_conn_id, 
+        ch_conn_id: str = CFG.clickhouse_conn_id,
+        s3_bucket: str = CFG.s3_bucket
     ):
         self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)
         self.ch_hook = ClickHouseHook(clickhouse_conn_id=ch_conn_id)
-        self.s3_io = S3ParquetIO(self.s3_hook, s3_bucket)
+        self.s3_io = S3IO(self.s3_hook, s3_bucket)
         self.bucket = s3_bucket
 
         creds = self.s3_hook.get_credentials()
@@ -107,9 +107,9 @@ class GoldAggregator:
         hour_end   = f"{y:04d}-{m:02d}-{d:02d} {h:02d}:59:59"
         report_date = f"{y:04d}-{m:02d}-{d:02d}"
 
-        for table in [C.STATION_HEALTH, C.STATION_ANOMALY]:
+        for table in [CFG.station_health, CFG.station_anomaly]:
             self.ch_hook.execute(f"""
-                ALTER TABLE {C.SCHEMA_NAME}.{table}
+                ALTER TABLE {CFG.schema_name}.{table}
                 DELETE WHERE hour_start >= '{hour_start}'
                         AND hour_start <= '{hour_end}'
                 SETTINGS mutations_sync = 1
@@ -118,7 +118,7 @@ class GoldAggregator:
         # health_daily MV target — delete the full date so it can be
         # re-aggregated from the surviving + new health_hourly rows.
         self.ch_hook.execute(f"""
-            ALTER TABLE {C.SCHEMA_NAME}.health_daily
+            ALTER TABLE {CFG.schema_name}.health_daily
             DELETE WHERE report_date = '{report_date}'
             SETTINGS mutations_sync = 1
         """)
@@ -128,16 +128,16 @@ class GoldAggregator:
         report_date = f"{y:04d}-{m:02d}-{d:02d}"
 
         daily_tables = {
-            C.STATION_SLAC:        "report_date",
-            C.STATION_OUTAGE:      "toDate(incident_start)",
-            C.STATION_REGION:      "report_date",
-            C.STATION_MAINTENANCE: "toDate(maintenance_start)",
-            C.STATION_HANDOVER:    "report_date",
-            C.STATION_ALARM:       "report_date",
+            CFG.station_slac:        "report_date",
+            CFG.station_outage:      "toDate(incident_start)",
+            CFG.station_region:      "report_date",
+            CFG.station_maintenance: "toDate(maintenance_start)",
+            CFG.station_handover:    "report_date",
+            CFG.station_alarm:       "report_date",
         }
         for table, date_col in daily_tables.items():
             self.ch_hook.execute(f"""
-                ALTER TABLE {C.SCHEMA_NAME}.{table}
+                ALTER TABLE {CFG.schema_name}.{table}
                 DELETE WHERE {date_col} = '{report_date}'
                 SETTINGS mutations_sync = 1
             """)
@@ -156,14 +156,14 @@ class GoldAggregator:
         ts_start = f"{min_ts[0]:04d}-{min_ts[1]:02d}-{min_ts[2]:02d} {min_ts[3]:02d}:00:00"
         ts_end   = f"{max_ts[0]:04d}-{max_ts[1]:02d}-{max_ts[2]:02d} {max_ts[3]:02d}:59:59"
 
-        for table in [C.STATION_HEALTH, C.STATION_ANOMALY]:
+        for table in [CFG.station_health, CFG.station_anomaly]:
             self.ch_hook.execute(f"""
-                ALTER TABLE {C.SCHEMA_NAME}.{table}
+                ALTER TABLE {CFG.schema_name}.{table}
                 DELETE WHERE hour_start >= '{ts_start}'
                         AND hour_start <= '{ts_end}'
                 SETTINGS mutations_sync = 1
             """)
-            logger.info(f"Cleared {C.SCHEMA_NAME}.{table}  [{ts_start} → {ts_end}]")
+            logger.info(f"Cleared {CFG.schema_name}.{table}  [{ts_start} → {ts_end}]")
 
         # health_daily is a MV target (AggregatingMergeTree).
         # It does NOT auto-clean when the source (health_hourly) is deleted,
@@ -172,12 +172,12 @@ class GoldAggregator:
         d_start = f"{dates[0][0]:04d}-{dates[0][1]:02d}-{dates[0][2]:02d}"
         d_end   = f"{dates[-1][0]:04d}-{dates[-1][1]:02d}-{dates[-1][2]:02d}"
         self.ch_hook.execute(f"""
-            ALTER TABLE {C.SCHEMA_NAME}.health_daily
+            ALTER TABLE {CFG.schema_name}.health_daily
             DELETE WHERE report_date >= '{d_start}'
                      AND report_date <= '{d_end}'
             SETTINGS mutations_sync = 1
         """)
-        logger.info(f"Cleared {C.SCHEMA_NAME}.health_daily  [{d_start} → {d_end}]")
+        logger.info(f"Cleared {CFG.schema_name}.health_daily  [{d_start} → {d_end}]")
 
     def clear_gold_daily_range(self, days: list[tuple[int, int, int]]):
         """Delete gold daily data (SLA, outage, region, maintenance, handover,
@@ -190,22 +190,22 @@ class GoldAggregator:
         d_end   = f"{max(days)[0]:04d}-{max(days)[1]:02d}-{max(days)[2]:02d}"
 
         daily_tables = {
-            C.STATION_SLAC:        "report_date",
-            C.STATION_OUTAGE:      "toDate(incident_start)",
-            C.STATION_REGION:      "report_date",
-            C.STATION_MAINTENANCE: "toDate(maintenance_start)",
-            C.STATION_HANDOVER:    "report_date",
-            C.STATION_ALARM:       "report_date",
+            CFG.station_slac:        "report_date",
+            CFG.station_outage:      "toDate(incident_start)",
+            CFG.station_region:      "report_date",
+            CFG.station_maintenance: "toDate(maintenance_start)",
+            CFG.station_handover:    "report_date",
+            CFG.station_alarm:       "report_date",
         }
 
         for table, date_col in daily_tables.items():
             self.ch_hook.execute(f"""
-                ALTER TABLE {C.SCHEMA_NAME}.{table}
+                ALTER TABLE {CFG.schema_name}.{table}
                 DELETE WHERE {date_col} >= '{d_start}'
                          AND {date_col} <= '{d_end}'
                 SETTINGS mutations_sync = 1
             """)
-            logger.info(f"Cleared {C.SCHEMA_NAME}.{table}  [{d_start} → {d_end}]")
+            logger.info(f"Cleared {CFG.schema_name}.{table}  [{d_start} → {d_end}]")
 
     # =========================================================================
     # Generic write helper
@@ -217,14 +217,14 @@ class GoldAggregator:
 
         try:
             self.ch_hook.execute(f"""
-                INSERT INTO {C.SCHEMA_NAME}.{ch_table}
+                INSERT INTO {CFG.schema_name}.{ch_table}
                 SELECT * FROM s3('{s3_url}', '{self.s3_access_key}', '{self.s3_secret_key}', 'Parquet')
                 SETTINGS use_hive_partitioning=0
             """)
         except Exception:
             logger.warning(f"S3 insert failed for {ch_table}, falling back to VALUES insert")
             self.ch_hook.execute(
-                f"INSERT INTO {C.SCHEMA_NAME}.{ch_table} ({', '.join(columns)}) VALUES",
+                f"INSERT INTO {CFG.schema_name}.{ch_table} ({', '.join(columns)}) VALUES",
                 params=[tuple(row) for _, row in df.iterrows()]
             )
 
@@ -336,7 +336,7 @@ class GoldAggregator:
                     e.incident_active,
                     e.incident_type,
                     e.maintenance_active
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_ST} t
+                    FROM {CFG.schema_name}.{CFG.station_staging_st} t
                     LEFT JOIN (
                         SELECT
                             station_id,
@@ -347,7 +347,7 @@ class GoldAggregator:
                             max(temperature_c) AS max_temp,
                             avg(throughput_mbps) AS avg_throughput,
                             max(error_count) AS error_count
-                        FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_PM}
+                        FROM {CFG.schema_name}.{CFG.station_staging_pm}
                         WHERE metric_time >= '{hour_start}' AND metric_time <= '{hour_end}'
                         GROUP BY station_id
                     ) m ON t.station_id = m.station_id
@@ -365,7 +365,7 @@ class GoldAggregator:
                                 event_type = 'incident_start'
                             ) AS incident_type,
                             max(event_type = 'maintenance_start') AS maintenance_active
-                        FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                        FROM {CFG.schema_name}.{CFG.station_staging_se}
                         WHERE event_time >= '{hour_start}' AND event_time <= '{hour_end}'
                         GROUP BY station_id
                     ) e ON t.station_id = e.station_id
@@ -403,7 +403,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_HEALTH} 
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_health} 
             #         SELECT * FROM s3(
             #             '{s3_url}', 
             #             '{self.s3_access_key}', 
@@ -416,7 +416,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting health scores into ClickHouse for {hour_start} to {hour_end}: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_HEALTH} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_health} (
             #                 station_id, hour_start, station_code, operator_code, province, region, density, technology,
             #                 session_count, unique_subscribers, total_bytes, avg_latency_ms, p95_latency_ms, avg_packet_loss_pct, high_latency_ratio,
             #                 avg_cpu_pct, max_cpu_pct, avg_memory_pct, avg_temperature_c, max_temperature_c, avg_throughput_mbps, error_count,
@@ -429,7 +429,7 @@ class GoldAggregator:
             #         logger.error(f"Error inserting health scores into ClickHouse via VALUES for {hour_start} to {hour_end}: {ex2}")
             #         raise ex2
 
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_HEALTH, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_health, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error inserting health scores into ClickHouse for {hour_start} to {hour_end}: {ex}")
             raise ex
@@ -462,7 +462,7 @@ class GoldAggregator:
                         min(health_score) AS min_health_score,
                         countIf(health_score < 60) AS hours_below_60,
                         countIf(health_score < 30) AS hours_below_30
-                    FROM {C.SCHEMA_NAME}.{C.STATION_HEALTH}
+                    FROM {CFG.schema_name}.{CFG.station_health}
                     WHERE toDate(hour_start) = '{report_date}'
                     GROUP BY station_id, station_code, report_date, operator_code, province, region, density, technology
                 ),
@@ -523,7 +523,7 @@ class GoldAggregator:
                         sumIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS total_incident_min,
                         maxIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS longest_incident_min,
                         avgIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS mttr_min
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE toDate(event_time) = '{report_date}'
                     GROUP BY station_id, event_date
                 ) e ON sc.station_id = e.station_id AND e.event_date = sc.report_date
@@ -548,7 +548,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_SLAC} 
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_slac} 
             #         SELECT * FROM s3(
             #             '{s3_url}', 
             #             '{self.s3_access_key}', 
@@ -560,7 +560,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting SLA compliance report into ClickHouse for {year:04d}-{month:02d}-{day:02d}: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_SLAC} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_slac} (
             #                 station_id, station_code, report_date, operator_code, province, region, density, technology,
             #                 total_hours, active_hours, down_hours, maintenance_hours, degraded_hours,
             #                 billable_hours, available_hours, uptime_pct, sla_target_pct, sla_met, sla_breach_hours,
@@ -572,7 +572,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting SLA compliance report into ClickHouse via VALUES for {year:04d}-{month:02d}-{day:02d}: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_SLAC, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_slac, df.columns.tolist())
             
         except Exception as ex:
             logger.error(f"Error computing SLA compliance for {year:04d}-{month:02d}-{day:02d}: {ex}")
@@ -628,7 +628,7 @@ class GoldAggregator:
                         sh.avg_cpu_pct AS current_cpu_pct,
                         sh.avg_throughput_mbps AS current_throughput,
                         sh.unique_subscribers AS current_subscribers
-                    FROM {C.SCHEMA_NAME}.{C.STATION_HEALTH} sh
+                    FROM {CFG.schema_name}.{CFG.station_health} sh
                     WHERE toDate(sh.hour_start) = '{report_date}'
                       AND toHour(sh.hour_start) = {hour}
                 ),
@@ -643,7 +643,7 @@ class GoldAggregator:
                         stddevPop(avg_throughput_mbps) AS baseline_throughput_std,
                         avg(unique_subscribers) AS baseline_subs_mean,
                         stddevPop(unique_subscribers) AS baseline_subs_std
-                    FROM {C.SCHEMA_NAME}.{C.STATION_HEALTH}
+                    FROM {CFG.schema_name}.{CFG.station_health}
                     WHERE toHour(hour_start) = {hour}
                       AND toDate(hour_start) >= '{baseline_start}'
                       AND toDate(hour_start) < '{report_date}'
@@ -702,7 +702,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_ANOMALY} 
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_anomaly} 
             #         SELECT * FROM s3(
             #             '{s3_url}', 
             #             '{self.s3_access_key}', 
@@ -714,7 +714,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting anomaly features into ClickHouse for {year:04d}-{month:02d}-{day:02d}: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_ANOMALY} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_anomaly} (
             #                 station_id, station_code, hour_start,
             #                 current_latency_ms, current_packet_loss, current_cpu_pct, current_throughput, current_subscribers,
             #                 baseline_latency_mean, baseline_latency_std,
@@ -728,7 +728,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting anomaly features into ClickHouse via VALUES for {year:04d}-{month:02d}-{day:02d}: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(result_df, s3_key, C.STATION_ANOMALY, result_df.columns.tolist())
+            self._generic_write_to_lake_ch(result_df, s3_key, CFG.station_anomaly, result_df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing anomaly features for {year:04d}-{month:02d}-{day:02d} {hour:02d}:00: {ex}")
             raise ex
@@ -753,7 +753,7 @@ class GoldAggregator:
                         event_time AS incident_start,
                         metadata AS start_meta,
                         row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE event_type = 'incident_start'
                       AND toDate(event_time) = '{report_date}'
                 ),
@@ -763,7 +763,7 @@ class GoldAggregator:
                         event_time AS incident_end,
                         metadata AS end_meta,
                         row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE event_type = 'incident_end'
                       AND toDate(event_time) >= '{report_date}'
                       AND toDate(event_time) <= toDate('{report_date}') + 1
@@ -787,7 +787,7 @@ class GoldAggregator:
                         uniq(st.imsi_hash) AS affected_subscribers,
                         sum(st.bytes_up + st.bytes_down) AS incident_bytes
                     FROM incident_pairs ip
-                    LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_STAGING_ST} st
+                    LEFT JOIN {CFG.schema_name}.{CFG.station_staging_st} st
                         ON ip.station_id = st.station_id
                         AND st.event_time >= ip.incident_start
                         AND st.event_time <= coalesce(ip.incident_end, now())
@@ -802,7 +802,7 @@ class GoldAggregator:
                         ip.incident_start,
                         avg(h.health_score) AS health_score_during
                     FROM incident_pairs ip
-                    LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_HEALTH} h
+                    LEFT JOIN {CFG.schema_name}.{CFG.station_health} h
                         ON ip.station_id = h.station_id
                         AND h.hour_start >= toStartOfHour(ip.incident_start)
                         AND h.hour_start <= toStartOfHour(coalesce(ip.incident_end, now()))
@@ -815,7 +815,7 @@ class GoldAggregator:
                         station_id,
                         toHour(event_time) AS hour_of_day,
                         sum(bytes_up + bytes_down) / 7 AS avg_hourly_bytes
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_ST}
+                    FROM {CFG.schema_name}.{CFG.station_staging_st}
                     WHERE toDate(event_time) >= '{baseline_start}'
                       AND toDate(event_time) < '{report_date}'
                     GROUP BY station_id, hour_of_day
@@ -870,7 +870,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_OUTAGE} 
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_outage} 
             #         SELECT * FROM s3(
             #             '{s3_url}', 
             #             '{self.s3_access_key}', 
@@ -882,7 +882,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting outage report into ClickHouse for {year:04d}-{month:02d}-{day:02d}: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_OUTAGE} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_outage} (
             #                 station_id, station_code, operator_code, province, region, technology,
             #                 incident_type, severity, incident_start, incident_end, duration_min, estimated_duration_min,
             #                 affected_subscribers, traffic_loss_bytes, hardware_quality, health_score_during
@@ -891,7 +891,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting outage report into ClickHouse via VALUES for {year:04d}-{month:02d}-{day:02d}: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_OUTAGE, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_outage, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing outage report for {year:04d}-{month:02d}-{day:02d}: {ex}")
             raise ex
@@ -924,7 +924,7 @@ class GoldAggregator:
                         quantile(0.95)(p95_latency_ms) AS p95_latency_ms,
                         avg(avg_packet_loss_pct) AS avg_packet_loss_pct,
                         countIf(incident_active = 1) AS incident_count
-                    FROM {C.SCHEMA_NAME}.{C.STATION_HEALTH}
+                    FROM {CFG.schema_name}.{CFG.station_health}
                     WHERE toDate(hour_start) = '{report_date}'
                     GROUP BY report_date, region, province, operator_code, technology
                 )
@@ -944,7 +944,7 @@ class GoldAggregator:
                         technology,
                         count() AS total_stations,
                         countIf(sla_met = 0) AS sla_breach_count
-                    FROM {C.SCHEMA_NAME}.{C.STATION_SLAC}
+                    FROM {CFG.schema_name}.{CFG.station_slac}
                     WHERE report_date = '{report_date}'
                     GROUP BY region, province, operator_code, technology
                 ) sla ON ha.region = sla.region 
@@ -971,7 +971,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_REGION}
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_region}
             #         SELECT * FROM s3(
             #             '{s3_url}',
             #             '{self.s3_access_key}',
@@ -983,7 +983,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting region daily report into ClickHouse: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_REGION} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_region} (
             #                 report_date, region, province, operator_code, technology,
             #                 station_count, active_station_count, total_subscribers, total_sessions, total_bytes,
             #                 avg_health_score, min_health_score, stations_critical, stations_degraded,
@@ -994,7 +994,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting region daily via VALUES: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_REGION, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_region, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing region daily report for {report_date}: {ex}")
             raise ex
@@ -1015,7 +1015,7 @@ class GoldAggregator:
                         event_time AS maintenance_start,
                         metadata AS start_meta,
                         row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE event_type = 'maintenance_start'
                       AND toDate(event_time) = '{report_date}'
                 ),
@@ -1025,7 +1025,7 @@ class GoldAggregator:
                         event_time AS maintenance_end,
                         metadata AS end_meta,
                         row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE event_type = 'maintenance_end'
                       AND toDate(event_time) >= '{report_date}'
                       AND toDate(event_time) <= toDate('{report_date}') + 1
@@ -1058,10 +1058,10 @@ class GoldAggregator:
                     h_before.health_score AS pre_maintenance_health,
                     h_after.health_score AS post_maintenance_health
                 FROM maint_pairs mp
-                LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_HEALTH} h_before
+                LEFT JOIN {CFG.schema_name}.{CFG.station_health} h_before
                     ON mp.station_id = h_before.station_id
                     AND h_before.hour_start = toStartOfHour(mp.maintenance_start) - INTERVAL 1 HOUR
-                LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_HEALTH} h_after
+                LEFT JOIN {CFG.schema_name}.{CFG.station_health} h_after
                     ON mp.station_id = h_after.station_id
                     AND h_after.hour_start = toStartOfHour(coalesce(mp.maintenance_end, now())) + INTERVAL 1 HOUR
             """)
@@ -1084,7 +1084,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_MAINTENANCE}
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_maintenance}
             #         SELECT * FROM s3(
             #             '{s3_url}',
             #             '{self.s3_access_key}',
@@ -1096,7 +1096,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting maintenance report into ClickHouse: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_MAINTENANCE} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_maintenance} (
             #                 station_id, station_code, operator_code, region, technology,
             #                 maintenance_start, maintenance_end,
             #                 planned_duration_min, actual_duration_min, overrun_min,
@@ -1107,7 +1107,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting maintenance report via VALUES: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_MAINTENANCE, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_maintenance, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing maintenance report for {report_date}: {ex}")
             raise ex
@@ -1135,13 +1135,13 @@ class GoldAggregator:
                     ) AS unique_subscribers,
                     src_traffic.avg_latency AS avg_latency_before_ms,
                     tgt_traffic.avg_latency AS avg_latency_after_ms
-                FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE} e
+                FROM {CFG.schema_name}.{CFG.station_staging_se} e
                 LEFT JOIN (
                     SELECT
                         station_id,
                         toDate(event_time) AS traffic_date,
                         avg(latency_ms) AS avg_latency
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_ST}
+                    FROM {CFG.schema_name}.{CFG.station_staging_st}
                     WHERE toDate(event_time) = '{report_date}'
                     GROUP BY station_id, traffic_date
                 ) src_traffic 
@@ -1152,7 +1152,7 @@ class GoldAggregator:
                         station_id,
                         toDate(event_time) AS traffic_date,
                         avg(latency_ms) AS avg_latency
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_ST}
+                    FROM {CFG.schema_name}.{CFG.station_staging_st}
                     WHERE toDate(event_time) = '{report_date}'
                     GROUP BY station_id, traffic_date
                 ) tgt_traffic 
@@ -1187,7 +1187,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_HANDOVER}
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_handover}
             #         SELECT * FROM s3(
             #             '{s3_url}',
             #             '{self.s3_access_key}',
@@ -1199,7 +1199,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting handover report into ClickHouse: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_HANDOVER} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_handover} (
             #                 report_date, source_station_id, source_station_code,
             #                 target_station_id, target_station_code,
             #                 source_region, target_region,
@@ -1210,7 +1210,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting handover report via VALUES: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_HANDOVER, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_handover, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing handover report for {report_date}: {ex}")
             raise ex
@@ -1233,7 +1233,7 @@ class GoldAggregator:
                         countIf(severity = 'critical') AS critical_count,
                         count() AS total_alarm_count,
                         topK(1)(description)[1] AS top_alarm_description
-                    FROM {C.SCHEMA_NAME}.{C.STATION_STAGING_SE}
+                    FROM {CFG.schema_name}.{CFG.station_staging_se}
                     WHERE event_type = 'alarm'
                       AND toDate(event_time) = '{report_date}'
                     GROUP BY report_date, station_id
@@ -1261,7 +1261,7 @@ class GoldAggregator:
                         station_id,
                         countIf(health_category IS NOT NULL) AS active_hours,
                         avg(health_score)::Float64 AS avg_health_score
-                    FROM {C.SCHEMA_NAME}.{C.STATION_HEALTH}
+                    FROM {CFG.schema_name}.{CFG.station_health}
                     WHERE toDate(hour_start) = '{report_date}'
                     GROUP BY station_id
                 ) h ON a.station_id = h.station_id
@@ -1283,7 +1283,7 @@ class GoldAggregator:
 
             # try:
             #     self.ch_hook.execute(f"""
-            #         INSERT INTO {C.SCHEMA_NAME}.{C.STATION_ALARM}
+            #         INSERT INTO {CFG.schema_name}.{CFG.station_alarm}
             #         SELECT * FROM s3(
             #             '{s3_url}',
             #             '{self.s3_access_key}',
@@ -1295,7 +1295,7 @@ class GoldAggregator:
             #     logger.error(f"Error inserting alarm daily report into ClickHouse: {ex1}")
             #     try:
             #         self.ch_hook.execute(f"""
-            #             INSERT INTO {C.SCHEMA_NAME}.{C.STATION_ALARM} (
+            #             INSERT INTO {CFG.schema_name}.{CFG.station_alarm} (
             #                 report_date, station_id, station_code, operator_code, region, technology,
             #                 warning_count, error_count, critical_count, total_alarm_count,
             #                 alarm_rate_per_hour, top_alarm_description, health_score_avg
@@ -1304,7 +1304,7 @@ class GoldAggregator:
             #     except Exception as ex2:
             #         logger.error(f"Error inserting alarm daily via VALUES: {ex2}")
             #         raise ex2
-            self._generic_write_to_lake_ch(df, s3_key, C.STATION_ALARM, df.columns.tolist())
+            self._generic_write_to_lake_ch(df, s3_key, CFG.station_alarm, df.columns.tolist())
         except Exception as ex:
             logger.error(f"Error computing alarm daily report for {report_date}: {ex}")
             raise ex

@@ -20,7 +20,11 @@ def get_s3_hook(conn_id: str) -> S3Hook:
 def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
     s3_hook = get_s3_hook(conn_id=conn_id)
     
-    creds = s3_hook.get_credentials()
+    try:
+        creds = s3_hook.get_credentials()
+    except Exception as e:
+        raise ValueError(f"Could not retrieve credentials for S3 connection ID: {conn_id}. Error: {e}")
+    
     s3_access_key = creds.access_key
     s3_secret_key = creds.secret_key
 

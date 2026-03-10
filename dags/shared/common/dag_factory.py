@@ -2,8 +2,8 @@ from datetime import datetime
 import re
 from typing import Callable
 
-from common.config import CFG
-from util.bronze_extractor import BronzeExtractor
+from shared.common.config import CFG
+from shared.util.bronze_extractor import BronzeExtractor
 
 from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException

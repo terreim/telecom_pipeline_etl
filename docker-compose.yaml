@@ -185,9 +185,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
         reservations:
-          memory: 128M
+          memory: 256M
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
       interval: 30s
@@ -546,6 +546,8 @@ services:
       - clickhouse-logs:/var/log/clickhouse-server
       # Mount custom config for ZooKeeper and S3 integration
       - ./config/clickhouse_config.xml:/etc/clickhouse-server/config.d/custom_config.xml:ro
+      # Grant S3/SOURCES privileges to default user via XML (SQL GRANT won't work on XML-managed users)
+      - ./config/clickhouse_users.xml:/etc/clickhouse-server/users.d/custom_grants.xml:ro
     deploy:
       resources:
         limits:

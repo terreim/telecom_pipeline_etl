@@ -19,9 +19,9 @@ from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
 from datetime import datetime, timedelta
 
-from config.config import PipelineConfig as C
-from util.warehouse_loader import ClickHouseLoader
-from util.gold_aggregator import GoldAggregator
+from shared.common.config import CFG
+from shared.util.warehouse_loader import ClickHouseLoader
+from shared.util.gold_aggregator import GoldAggregator
 
 import logging
 log = logging.getLogger(__name__)
@@ -34,9 +34,9 @@ default_args = {
 }
 
 ALL_SILVER_SUBPATHS = {
-    C.STATION_CLEANED_ST: C.STATION_STAGING_ST,
-    C.STATION_CLEANED_PM: C.STATION_STAGING_PM,
-    C.STATION_CLEANED_SE: C.STATION_STAGING_SE,
+    CFG.STATION_CLEANED_ST: CFG.STATION_STAGING_ST,
+    CFG.STATION_CLEANED_PM: CFG.STATION_STAGING_PM,
+    CFG.STATION_CLEANED_SE: CFG.STATION_STAGING_SE,
 }
 
 # =============================================================================

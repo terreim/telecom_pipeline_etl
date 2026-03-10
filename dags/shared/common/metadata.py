@@ -5,8 +5,8 @@ Each metadata file corresponds to an hour-partition of a specific table in bronz
 
 import json
 import logging
-from common.connections import get_s3_hook
-from common.config import CFG
+from shared.common.connections import get_s3_hook
+from shared.common.config import CFG
 
 # logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class MetadataManager:
         must not interpret those as first-run signals.
         """
         try:
-            content = self.s3_hook.read_key(bucket=self.s3_bucket, key=key)
+            content = self.s3_hook.read_key(bucket_name=self.s3_bucket, key=key)
         except Exception as e:
             if self._is_not_found(e):
                 return None

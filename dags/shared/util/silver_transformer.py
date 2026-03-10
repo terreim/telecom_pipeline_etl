@@ -3,11 +3,12 @@ import pandas as pd
 import logging
 from typing import Optional
 
-from telecom_pipeline_etl.common.s3 import S3ParquetIO
+from shared.common.s3 import S3IO
+from shared.common.config import CFG
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from telecom_pipeline_etl.config.config import PipelineConfig as C
+
 import re
 
 logger = logging.getLogger(__name__)
@@ -15,15 +16,15 @@ logger = logging.getLogger(__name__)
 class SilverTransformer:
     def __init__(
         self,
-        s3_conn_id: str = C.S3_CONN_ID,
-        s3_bucket: str = C.S3_BUCKET,
-        bronze_prefix: str = C.BRONZE_PREFIX,
-        silver_prefix: str = C.SILVER_PREFIX,
-        quarantine_prefix: str = C.QUARANTINE_PREFIX,
+        s3_conn_id: str = CFG.s3_conn_id,
+        s3_bucket: str = CFG.s3_bucket,
+        bronze_prefix: str = CFG.bronze_prefix,
+        silver_prefix: str = CFG.silver_prefix,
+        quarantine_prefix: str = CFG.quarantine_prefix,
         postgres_conn_id: Optional[str] = None,
     ):
         self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)
-        self.s3_io = S3ParquetIO(self.s3_hook, s3_bucket)
+        self.s3_io = S3IO(self.s3_hook, s3_bucket)
         self.bucket = s3_bucket
         self.bronze_prefix = bronze_prefix
         self.silver_prefix = silver_prefix
@@ -50,9 +51,9 @@ class SilverTransformer:
                 lc.region, 
                 lc.density,
                 bs.technology
-            FROM {C.SCHEMA_NAME}.{C.STATION_BS} bs
-            LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_OP} op ON bs.operator_id = op.operator_id
-            LEFT JOIN {C.SCHEMA_NAME}.{C.STATION_LC} lc ON bs.location_id = lc.location_id
+            FROM {CFG.schema_name}.{CFG.station_bs} bs
+            LEFT JOIN {CFG.schema_name}.{CFG.station_op} op ON bs.operator_id = op.operator_id
+            LEFT JOIN {CFG.schema_name}.{CFG.station_lc} lc ON bs.location_id = lc.location_id
             """
             self._station_dim = self.pg_hook.get_pandas_df(sql=sql)
             logger.info(f"Loaded {len(self._station_dim)} station dimension records")
@@ -438,7 +439,7 @@ class SilverTransformer:
     def transform_traffic(self, table_name: str, year: int, month: int, day: int, hour: int, batch_id: str, manual_run: bool = False) -> dict:
         return self._transform_generic(
             table_name=table_name,
-            silver_subpath=C.STATION_CLEANED_ST,
+            silver_subpath=CFG.STATION_CLEANED_ST,
             validate_fn=self._validate_traffic,
             enrich=True,
             add_derived_fn=self._add_derived_columns_traffic,
@@ -453,7 +454,7 @@ class SilverTransformer:
     def transform_metrics(self, table_name: str, year: int, month: int, day: int, hour: int, batch_id: str, manual_run: bool = False) -> dict:
         return self._transform_generic(
             table_name=table_name,
-            silver_subpath=C.STATION_CLEANED_PM,
+            silver_subpath=CFG.STATION_CLEANED_PM,
             validate_fn=self._validate_metrics,
             enrich=True,
             add_derived_fn=self._add_derived_columns_metrics,
@@ -468,7 +469,7 @@ class SilverTransformer:
     def transform_events(self, table_name: str, year: int, month: int, day: int, hour: int, batch_id: str, manual_run: bool = False) -> dict:
         return self._transform_generic(
             table_name=table_name,
-            silver_subpath=C.STATION_CLEANED_SE,
+            silver_subpath=CFG.STATION_CLEANED_SE,
             validate_fn=self._validate_events,
             enrich=True,
             add_derived_fn=self._add_derived_columns_events,

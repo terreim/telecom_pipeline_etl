@@ -11,8 +11,9 @@ Three scenarios on get_watermark:
 """
 
 import logging
-from datetime import datetime, timedelta
-from common.metadata import MetadataManager
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from shared.common.metadata import MetadataManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ class S3WatermarkStore:
     # ── Key helper ────────────────────────────────────────────────────────────
 
     def _watermark_key(self, zone: str, table: str) -> str:
-        return f"metadata/watermark/{zone}/{table}/_metadata.json"
+        return f"metadata/watermark/{zone}/{table}/_latest.json"
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,9 @@ class S3WatermarkStore:
         on gap recovery after outages.
         """
         prev_batch = self.mm.read_metadata(self._watermark_key(zone, table))
+        # Ensure elt_now is timezone-aware (UTC)
+        if elt_now.tzinfo is None:
+            elt_now = elt_now.replace(tzinfo=timezone.utc)
         to_uncapped = elt_now - timedelta(seconds=buffer_seconds)
 
         if prev_batch is None:
@@ -58,11 +62,17 @@ class S3WatermarkStore:
             else:
                 # Scenario 2: data exists but no metadata — caller must run chunked backfill
                 logger.info(f"[{table}] First run with initial_watermark={initial_watermark.isoformat()}")
+                # Ensure initial_watermark is timezone-aware (UTC)
+                if initial_watermark.tzinfo is None:
+                    initial_watermark = initial_watermark.replace(tzinfo=timezone.utc)
                 to = min(to_uncapped, initial_watermark + timedelta(seconds=max_window_seconds))
                 return initial_watermark, initial_watermark, to, True, None
 
         # Scenario 3: normal run or gap recovery
         nominal_from = datetime.fromisoformat(prev_batch["source_watermark"]["to"])
+        # Ensure nominal_from is timezone-aware (UTC)
+        if nominal_from.tzinfo is None:
+            nominal_from = nominal_from.replace(tzinfo=timezone.utc)
         from_wm = nominal_from - timedelta(seconds=overlap_seconds)
 
         # Cap to prevent OOM on large gaps
@@ -100,7 +110,14 @@ class S3WatermarkStore:
         """
         Persists the watermark metadata for a given zone and table.
         """
-    
+
+        # Duplicate another key but with timestaped history for audit
+        self.mm.write_metadata(
+            key=f"metadata/watermark/{zone}/{table}/{datetime.utcnow().isoformat()}.json",
+            metadata_dict=metadata,
+        )
+
+        # Write _latest.json
         self.mm.write_metadata(
             key=self._watermark_key(zone, table),
             metadata_dict=metadata,

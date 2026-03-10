@@ -2,7 +2,7 @@
     Airflow Assets used in the ELT pipeline.
 """
 
-from common.config import CFG
+from shared.common.config import CFG
 from airflow.sdk import Asset
 
 def build_assets(cfg = CFG, option: str = "bronze") -> dict[str, Asset]:

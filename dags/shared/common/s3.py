@@ -9,8 +9,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from common.config import CFG
-from common.connections import get_s3_hook, get_s3_credentials
+from shared.common.config import CFG
+from shared.common.connections import get_s3_hook, get_s3_credentials
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class S3IO:
         
         Expects arguments:
 
-            prefix: str - the S3 prefix (e.g. "bronze/station_st")
+            prefix: str - the S3 prefix (e.g. "bronze/subscriber_traffic")
             filename: str - the filename (e.g. "xxx.parquet")
             cutoff_time: datetime - the cutoff time for partitioning
             zone: str - the zone (e.g. "bronze", "silver", "gold")

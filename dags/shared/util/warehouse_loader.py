@@ -2,8 +2,8 @@ import logging
 from typing import Optional
 import pandas as pd
 
-from config.config import PipelineConfig as C
-from telecom_pipeline_etl.common.s3 import S3ParquetIO
+from shared.common.config import CFG
+from shared.common.s3 import S3IO
 
 from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 class ClickHouseLoader:
     def __init__(
         self,
-        ch_conn_id: str = C.CLICKHOUSE_CONN_ID,
-        s3_conn_id: str = C.S3_CONN_ID,
-        s3_bucket: str = C.S3_BUCKET,
-        silver_prefix: str = C.SILVER_PREFIX,
+        ch_conn_id: str = CFG.clickhouse_conn_id,
+        s3_conn_id: str = CFG.s3_conn_id,
+        s3_bucket: str = CFG.s3_bucket,
+        silver_prefix: str = CFG.silver_prefix,
     ):
         self.ch_hook = ClickHouseHook(clickhouse_conn_id=ch_conn_id)
         self.s3_hook = S3Hook(aws_conn_id=s3_conn_id)
@@ -144,7 +144,7 @@ class ClickHouseLoader:
 
     def insert_silver_to_clickhouse(self, s3_key: str, staging_table: str) -> dict:
         self.ch_hook.execute(f"""
-            INSERT INTO {C.SCHEMA_NAME}.{staging_table}
+            INSERT INTO {CFG.schema_name}.{staging_table}
             SELECT * FROM s3(
                 '{self.s3_endpoint}/{self.s3_bucket}/{s3_key}',
                 '{self.s3_access_key}',
@@ -184,7 +184,7 @@ class ClickHouseLoader:
         for prefix, keys in partition_keys.items():
             glob_pattern = f"{prefix}*.parquet"
             self.ch_hook.execute(f"""
-                INSERT INTO {C.SCHEMA_NAME}.{staging_table}
+                INSERT INTO {CFG.schema_name}.{staging_table}
                 SELECT * FROM s3(
                     '{self.s3_endpoint}/{self.s3_bucket}/{glob_pattern}',
                     '{self.s3_access_key}',
@@ -195,7 +195,7 @@ class ClickHouseLoader:
             """)
             logger.info(
                 f"Batch-inserted {len(keys)} files from {prefix} "
-                f"into {C.SCHEMA_NAME}.{staging_table}"
+                f"into {CFG.schema_name}.{staging_table}"
             )
 
             # Mark each individual key so idempotency checks still work
@@ -217,7 +217,7 @@ class ClickHouseLoader:
         silver transform completed for that hour.  Returns every parquet file
         in those partitions that has not yet been loaded to ClickHouse.
         """
-        s3_io = S3ParquetIO(self.s3_hook, self.s3_bucket)
+        s3_io = S3IO(self.s3_hook, self.s3_bucket)
 
         now_utc = pd.Timestamp.now('UTC')
         start = now_utc.floor('h')
@@ -255,7 +255,7 @@ class ClickHouseLoader:
         Use this when ClickHouse data is lost and you need the staging
         tasks to re-insert everything from silver parquets.
         """
-        s3_io = S3ParquetIO(self.s3_hook, self.s3_bucket)
+        s3_io = S3IO(self.s3_hook, self.s3_bucket)
         now_utc = pd.Timestamp.now("UTC")
         start = now_utc.floor("h")
 
@@ -294,7 +294,7 @@ class ClickHouseLoader:
         Also clears the corresponding ``.ch_loaded_*`` markers so the
         new silver output will be re-loaded to ClickHouse.
         """
-        s3_io = S3ParquetIO(self.s3_hook, self.s3_bucket)
+        s3_io = S3IO(self.s3_hook, self.s3_bucket)
         now_utc = pd.Timestamp.now("UTC")
         start = now_utc.floor("h")
 

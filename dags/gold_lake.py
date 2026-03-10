@@ -6,11 +6,11 @@ import json
 
 from pendulum import now as pendulum_now
 
-from config.config import PipelineConfig as C
+from shared.common.config import CFG
 
-from util.silver_transformer import SilverTransformer
-from util.gold_aggregator import GoldAggregator
-from util.warehouse_loader import ClickHouseLoader
+from shared.util.silver_transformer import SilverTransformer
+from shared.util.gold_aggregator import GoldAggregator
+from shared.util.warehouse_loader import ClickHouseLoader
 from silver_lake import staging_trigger_events, staging_trigger_metrics, staging_trigger_traffic
 
 default_args = {
@@ -50,9 +50,9 @@ with DAG(
     def load_dim_to_clickhouse():
         loader = ClickHouseLoader()
 
-        transformer = SilverTransformer(postgres_conn_id=C.POSTGRES_CONN_ID)
+        transformer = SilverTransformer(postgres_conn_id=CFG.postgres_conn_id)
         dim_df = transformer._load_station_dimension()
-        loader.load_dim(schema=C.SCHEMA_NAME, table_name="dim_station", dict_name="dict_station", dim_df=dim_df)
+        loader.load_dim(schema=CFG.schema_name, table_name="dim_station", dict_name="dict_station", dim_df=dim_df)
         return f"Loaded dim_station with {len(dim_df)} records"
 
     load_dim_to_clickhouse()
@@ -83,7 +83,7 @@ with DAG(
                     continue
                 loader.insert_silver_to_clickhouse(
                     s3_key=s3_key,
-                    staging_table=C.STATION_STAGING_ST,
+                    staging_table=CFG.station_staging_st,
                 )
                 loaded += 1
         unique_hours = list(set(map(tuple, all_hours)))
@@ -118,7 +118,7 @@ with DAG(
                     continue
                 loader.insert_silver_to_clickhouse(
                     s3_key=s3_key,
-                    staging_table=C.STATION_STAGING_PM,
+                    staging_table=CFG.STATION_STAGING_PM,
                 )
                 loaded += 1
         unique_hours = list(set(map(tuple, all_hours)))
@@ -153,7 +153,7 @@ with DAG(
                     continue
                 loader.insert_silver_to_clickhouse(
                     s3_key=s3_key,
-                    staging_table=C.STATION_STAGING_SE,
+                    staging_table=CFG.STATION_STAGING_SE,
                 )
                 loaded += 1
         unique_hours = list(set(map(tuple, all_hours)))
@@ -184,9 +184,9 @@ with DAG(
 
         # Map silver subpaths to their CH staging tables
         silver_to_staging = {
-            C.STATION_CLEANED_ST: C.STATION_STAGING_ST,
-            C.STATION_CLEANED_PM: C.STATION_STAGING_PM,
-            C.STATION_CLEANED_SE: C.STATION_STAGING_SE,
+            CFG.station_cleaned_st: CFG.station_staging_st,
+            CFG.station_cleaned_pm: CFG.station_staging_pm,
+            CFG.station_cleaned_se: CFG.station_staging_se,
         }
 
         total_loaded = 0

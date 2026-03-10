@@ -7,10 +7,10 @@ from airflow.sdk import DAG, task
 from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 import os
 
-from config.config import PipelineConfig as C
+from shared.common.config import CFG
 
-from util.warehouse_loader import ClickHouseLoader
-from util.silver_transformer import SilverTransformer
+from shared.util.warehouse_loader import ClickHouseLoader
+from shared.util.silver_transformer import SilverTransformer
 
 logger = logging.getLogger(__name__)
 
