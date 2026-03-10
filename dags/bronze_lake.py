@@ -16,6 +16,7 @@ with bronze.create_dag(dag_id="bronze_high_volume", schedule="*/1 * * * *"):
         outlets=[bronze_assets['bronze_traffic']],
         table=CFG.station_st,
         pk_column="traffic_id",
+        time_column="event_time",
         target_columns=[
                 "traffic_id", "station_id", "event_time", "imsi_hash", 
                 "tmsi", "ip_address", "destination_ip", "destination_port",
@@ -31,6 +32,7 @@ with bronze.create_dag(dag_id="bronze_low_volume", schedule="*/5 * * * *"):
         outlets=[bronze_assets['bronze_events']],
         table=CFG.station_se,
         pk_column="event_id",
+        time_column="event_time",
         target_columns=[
                 "event_id", "station_id", "event_time", "event_type", "severity",
                 "description", "metadata", "target_station_id", "created_at", "updated_at"
@@ -40,6 +42,7 @@ with bronze.create_dag(dag_id="bronze_low_volume", schedule="*/5 * * * *"):
         outlets=[bronze_assets['bronze_metrics']],
         table=CFG.station_pm,
         pk_column="metric_id",
+        time_column="metric_time",
         target_columns=[
                 "metric_id", "station_id", "metric_time", "cpu_usage_pct", 
                 "memory_usage_pct", "disk_usage_pct", "temperature_celsius", "power_consumption_watts",

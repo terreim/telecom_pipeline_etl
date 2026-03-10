@@ -46,12 +46,12 @@ class BronzeDag(DagFactory):
             self, 
             outlets: list[str],
             table: str,
-            pk_column: str = "traffic_id",
-            time_column: str = 'event_time',
+            pk_column: str,
+            time_column: str,
             target_columns: list[str] = None
         ) -> Callable:
         
-            @task(outlets=outlets)
+            @task(outlets=outlets, task_id=f"ingest_{table}")
             def ingest(**context):
                 return self.extractor.extract_bronze(
                     schema=CFG.schema_name,
@@ -71,7 +71,7 @@ class BronzeDag(DagFactory):
             boundary_type: str = 'hourly'
         ) -> Callable:
         
-        @task(outlets=outlets)
+        @task(outlets=outlets, task_id=f"signal_{table}")
         def signal(**context):
             interval_end = context['data_interval_end']
 

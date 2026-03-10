@@ -1,3 +1,83 @@
+"""
+Provides the BronzeExtractor class and supporting utilities for incrementally
+extracting data from a PostgreSQL source and loading it into an S3 data lake
+as Parquet files (the "bronze" layer in a medallion architecture).
+
+Classes
+-------
+    DelayAccumulator
+        A dataclass that accumulates delay metrics across multiple data chunks
+        during an extraction run. Tracks:
+        - Maximum and P99 propagation delay (created_at - event_time)
+        - Maximum and P99 clock offset (updated_at - created_at)
+        - Count of late arrivals and updated records
+    BronzeExtractor
+        Main class responsible for the Extract-Load (EL) pipeline from Postgres
+        to S3. Supports:
+        - Watermark-based incremental extraction with configurable buffer and
+        overlap windows
+        - Automatic backfill via iterative watermark advancement
+        - Single-file extraction (cutoff_time partitioning)
+        - Per-hour event-time partitioned extraction for correct backfill
+        - Delay and propagation metric collection per batch
+        - Schema unification and JSONB column serialization
+    Methods
+    -------
+    BronzeExtractor._get_initial_watermark(schema, table, mode, initial_wm)
+        Queries Postgres for the minimum updated_at value, either from the
+        beginning of the table ("first_run") or after a given point ("catch_up").
+    BronzeExtractor._accumulate_delays(acc, df, time_column, buffer_seconds)
+        Updates a DelayAccumulator with propagation and clock offset metrics
+        from a DataFrame chunk.
+    BronzeExtractor._finalize_delays(acc)
+        Converts a DelayAccumulator into a serializable metrics dictionary,
+        including P99 values computed via pandas quantile.
+    BronzeExtractor.extract_bronze(table, schema, pk_column, target_columns,
+                                batch_id, time_column)
+        Orchestrates the incremental extraction loop. Advances the watermark
+        window-by-window until caught up to "now - buffer". Handles skipped
+        windows by jumping forward to the next available data point, and
+        returns a summary of windows processed.
+    BronzeExtractor.el(schema, table, pk_column, target_columns, batch_id,
+                    fr, to, batch_limit, chunk_size, time_column)
+        Executes the SQL query for a single watermark window and delegates to
+        either _el_single (no time_column) or _el_partitioned (with time_column).
+        Returns a metadata dict (or list of dicts) describing the output.
+    BronzeExtractor._el_single(conn, cursor, columns, table, batch_id,
+                            cutoff_time, chunk_size)
+        Streams query results into a single Parquet file, uploads it to S3
+        under a cutoff_time-based key, and returns extraction metadata.
+    BronzeExtractor._el_partitioned(conn, cursor, columns, table, batch_id,
+                                    cutoff_time, chunk_size, time_column)
+        Streams query results into per-hour Parquet writers keyed by the
+        event time column. Records with null/unparseable event times fall
+        back to the cutoff_time hour. Uploads each partition file to S3
+        and returns aggregated extraction metadata.
+    Usage
+    -----
+    Instantiate BronzeExtractor and call extract_bronze() from an Airflow DAG
+    task or any orchestration context:
+        extractor = BronzeExtractor()
+        result = extractor.extract_bronze(
+            table="my_table",
+            schema="public",
+            pk_column="id",
+            target_columns=["id", "event_time", "created_at", "updated_at", "value"],
+            batch_id="dag_run_2024_01_01",
+            time_column="event_time",
+    Dependencies
+    ------------
+    - shared.common.s3.S3IO
+    - shared.common.metadata_template.bronze_metadata_template
+    - shared.common.config.CFG
+    - shared.common.schema.unify_schema, serialize_jsonb_columns
+    - shared.common.connections.get_postgres_hook, pg_cursor
+    - shared.common.metadata.MetadataManager
+    - shared.common.watermark.S3WatermarkStore
+    - shared.common.sql_builder.sql_bronze_extractor
+    - shared.common.validators.check_bronze_schema
+
+"""
 import os
 import tempfile
 import time
@@ -10,13 +90,14 @@ from dataclasses import dataclass, field
 import logging
 
 from shared.common.s3 import S3IO
-from shared.common.metadata_template import metadata_template
+from shared.common.metadata_template import bronze_metadata_template
 from shared.common.config import CFG
 from shared.common.schema import unify_schema, serialize_jsonb_columns
 from shared.common.connections import get_postgres_hook, pg_cursor
 from shared.common.metadata import MetadataManager
 from shared.common.watermark import S3WatermarkStore
 from shared.common.sql_builder import sql_bronze_extractor
+from shared.common.validators import check_bronze_schema
 
 logger = logging.getLogger(__name__)
 
@@ -131,24 +212,44 @@ class BronzeExtractor:
         """
         windows_processed = 0
         initial_wm = self._get_initial_watermark(schema=schema, table=table, initial_wm=None, mode="first_run")
+        elt_now=datetime.utcnow().replace(tzinfo=timezone.utc)
 
         while True:
+            if windows_processed >= CFG.max_window_per_run:
+                logger.info(f"Hit max windows ({CFG.max_window_per_run}), yielding to next DAG run.")
+                break
+
             t0 = time.monotonic()
             batch_id_windowed = f"{batch_id}_w{windows_processed}"
-            meta = metadata_template()
+            meta = bronze_metadata_template()
             meta |= {"layer": "bronze", "table": table, "batch_id": batch_id_windowed, "dedup_key": [pk_column]}
 
             fr, n_fr, to, first, prev_bid = self.watermark_store.get_watermark(
                 zone=self.zone,
                 table=table,
-                elt_now=datetime.utcnow(),
+                elt_now=elt_now,
                 buffer_seconds=CFG.buffer_seconds,
                 overlap_seconds=CFG.overlap_seconds,
                 initial_watermark=initial_wm,
             )
 
-            if fr >= datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(seconds=CFG.buffer_seconds):
-                logger.info(f"Watermark caught up for {schema}.{table}, stopping.")
+            if to <= n_fr:
+                logger.info(f"Window collapsed (to <= nominal_from), caught up.")
+                break
+
+            logger.info(f"""
+                Info:
+                - Window {windows_processed}: [{fr} → {to}] (nominal_from={n_fr})
+                - First window: {first}
+                - Previous batch_id: {prev_bid}
+                - Initial watermark: {initial_wm}
+                - ELT now: {elt_now}
+                - Buffer seconds: {CFG.buffer_seconds}
+            """)
+
+            if n_fr >= elt_now - timedelta(seconds=CFG.buffer_seconds):
+                logger.info(f"[{n_fr} >= {elt_now - timedelta(seconds=CFG.buffer_seconds)}] Watermark caught up for {schema}.{table}, stopping.")
+                logger.info(f"Next window would be [{fr} → {to}] with nominal_from={n_fr} and buffer={CFG.buffer_seconds}s")
                 break
 
             meta["previous_batch_id"] = prev_bid
@@ -285,8 +386,9 @@ class BronzeExtractor:
                 self._accumulate_delays(acc, df, None, CFG.buffer_seconds)
                 
                 df = serialize_jsonb_columns(df)
-                
+                check_bronze_schema(df, table=table)
                 table_pa = pa.Table.from_pandas(df, preserve_index=False)
+                
 
                 if writer is None:
                     parquet_schema = unify_schema(table_pa.schema)
@@ -382,6 +484,7 @@ class BronzeExtractor:
                     group_df = group_df.drop(columns=[c for c in group_df.columns if c.startswith('_partition')], errors='ignore')
 
                     table_pa = pa.Table.from_pandas(group_df, preserve_index=False)
+                    check_bronze_schema(df, table=table)
 
                     if key not in writers:
                         tmp_file = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)

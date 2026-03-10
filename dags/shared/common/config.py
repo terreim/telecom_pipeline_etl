@@ -130,6 +130,7 @@ class PipelineConfig:
     # Numeric configs
     buffer_seconds: int = 240
     overlap_seconds: int = 24
+    max_window_per_run: int = 100
 
     @classmethod
     @lru_cache(maxsize=1)

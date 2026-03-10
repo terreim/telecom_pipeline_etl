@@ -75,20 +75,19 @@ from shared.common.config import CFG
 def sql_dim_station() -> str:
     return f"""
         SELECT 
-                bs.station_id,
-                bs.station_code,
-                op.operator_code, 
-                op.operator_name, 
-                lc.province, 
-                lc.district,
-                lc.region, 
-                lc.density,
-                bs.technology
-            FROM {CFG.schema_name}.{CFG.station_bs} bs
-            LEFT JOIN {CFG.schema_name}.{CFG.station_op} op ON bs.operator_id = op.operator_id
-            LEFT JOIN {CFG.schema_name}.{CFG.station_lc} lc ON bs.location_id = lc.location_id
+            bs.station_id,
+            bs.station_code,
+            op.operator_code, 
+            op.operator_name, 
+            lc.province, 
+            lc.district,
+            lc.region, 
+            lc.density,
+            bs.technology
+        FROM {CFG.schema_name}.{CFG.station_bs} bs
+        LEFT JOIN {CFG.schema_name}.{CFG.station_op} op ON bs.operator_id = op.operator_id
+        LEFT JOIN {CFG.schema_name}.{CFG.station_lc} lc ON bs.location_id = lc.location_id
     """
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Bronze layer template
@@ -98,8 +97,8 @@ def sql_bronze_extractor(table_name: str, columns: list[str], overlap: int, buff
     return f"""
         SELECT {', '.join(columns)}
         FROM {CFG.schema_name}.{table_name}
-        WHERE updated_at > %(nominal_from)s - INTERVAL '{overlap}s'
-            AND updated_at <= %(max_updated_at)s - INTERVAL '{buffer}s'
+        WHERE updated_at > %(nominal_from)s
+            AND updated_at <= %(max_updated_at)s
         ORDER BY updated_at ASC, {pk_column} ASC
         """
 

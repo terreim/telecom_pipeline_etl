@@ -1,4 +1,4 @@
-def metadata_template() -> dict:
+def bronze_metadata_template() -> dict:
     """
     Returns a template for metadata dicts. Callers should not mutate this directly;
     import and call this function to get a fresh dict, then customize and write it.
@@ -15,7 +15,6 @@ def metadata_template() -> dict:
         "record_count": 0,
         "quarantine_count": 0,
         "loaded_to_silver": False,
-        "loaded_to_warehouse": False,
         "is_chunked": False,
         # "source_watermark": {
         #     "column": "updated_at",
@@ -40,3 +39,28 @@ def metadata_template() -> dict:
         "created_at": None, # simple ISO format string, to be filled by Airflow 
         "processing_duration_seconds": 0.0 # to be filled by Airflow
     }
+
+def silver_metadata_template() -> dict:
+    """
+    Returns a template for metadata dicts. Callers should not mutate this directly;
+    import and call this function to get a fresh dict, then customize and write it.
+    """
+    return {
+        "schema_version": 1,
+        "status": None,
+        "layer": "silver",
+        "table": None,
+        "partition": None,
+        "batch_id": None,
+        "source_bronze_keys": [],   # lineage back to bronze parquets
+        "record_count": 0,
+        "quarantine_count": 0,
+        "loaded_to_warehouse": False,
+        "data_keys": [],
+        "quarantine_keys": [],
+        "created_at": None,
+        "processing_duration_seconds": 0.0,
+    }
+
+def gold_metadata_template() -> dict:
+    pass
