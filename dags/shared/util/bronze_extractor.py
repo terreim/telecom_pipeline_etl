@@ -233,10 +233,6 @@ class BronzeExtractor:
                 initial_watermark=initial_wm,
             )
 
-            if to <= n_fr:
-                logger.info(f"Window collapsed (to <= nominal_from), caught up.")
-                break
-
             logger.info(f"""
                 Info:
                 - Window {windows_processed}: [{fr} → {to}] (nominal_from={n_fr})
@@ -246,6 +242,10 @@ class BronzeExtractor:
                 - ELT now: {elt_now}
                 - Buffer seconds: {CFG.buffer_seconds}
             """)
+            
+            if to <= n_fr:
+                logger.info(f"Window collapsed (to <= nominal_from), caught up.")
+                break
 
             if n_fr >= elt_now - timedelta(seconds=CFG.buffer_seconds):
                 logger.info(f"[{n_fr} >= {elt_now - timedelta(seconds=CFG.buffer_seconds)}] Watermark caught up for {schema}.{table}, stopping.")
@@ -267,7 +267,7 @@ class BronzeExtractor:
             )
 
             meta |= el_result 
-            meta["created_at"] = datetime.utcnow().isoformat()
+            meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
             meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
             self.watermark_store.set_watermark(
                 zone=self.zone,
@@ -289,7 +289,7 @@ class BronzeExtractor:
                         fr, n_fr, to, CFG.buffer_seconds, 0 if first else CFG.overlap_seconds
                     )
                     meta["status"] = "skipped"
-                    meta["created_at"] = datetime.utcnow().isoformat()
+                    meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
                     self.watermark_store.set_watermark(zone=self.zone, table=table, metadata=meta)
                     break
                 
@@ -298,7 +298,7 @@ class BronzeExtractor:
                     fr, n_fr, next_data, CFG.buffer_seconds, 0 if first else CFG.overlap_seconds
                 )
                 meta["status"] = "skipped"
-                meta["created_at"] = datetime.utcnow().isoformat()
+                meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
                 self.watermark_store.set_watermark(zone=self.zone, table=table, metadata=meta)
                 windows_processed += 1
                 continue
@@ -350,12 +350,12 @@ class BronzeExtractor:
                 if time_column:
                     return self._el_partitioned(
                         conn, cursor, columns, table, batch_id,
-                        fr, chunk_size, time_column,
+                        to, chunk_size, time_column,
                     )
                 else:
                     return self._el_single(
                         conn, cursor, columns, table, batch_id,
-                        fr, chunk_size,
+                        to, chunk_size,
                     )
             except Exception as e:
                 logger.error(f"Error during extraction process: {e}")
@@ -484,7 +484,7 @@ class BronzeExtractor:
                     group_df = group_df.drop(columns=[c for c in group_df.columns if c.startswith('_partition')], errors='ignore')
 
                     table_pa = pa.Table.from_pandas(group_df, preserve_index=False)
-                    check_bronze_schema(df, table=table)
+                    check_bronze_schema(group_df, table=table)
 
                     if key not in writers:
                         tmp_file = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)

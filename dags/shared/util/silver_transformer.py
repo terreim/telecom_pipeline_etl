@@ -195,6 +195,7 @@ class SilverTransformer:
             
             for data_key in bronze_meta.get("data_keys", []):
                 partition = self._extract_partition(data_key)
+                logger.info(partition)
 
                 try:
                     df = self.s3_io.read_parquet(data_key)

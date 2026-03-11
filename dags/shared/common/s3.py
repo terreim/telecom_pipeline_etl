@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import logging
+import shutil
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -88,14 +89,18 @@ class S3IO:
         Uses PyArrow's ``iter_batches`` so that only one chunk lives in
         memory at a time.  The downloaded temp file is kept alive for the
         entire iteration.
+        TODO: verify if tmp_dir is being deleted before caller can call for the next one, make tmp_dir outlives the generator.
         """
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             local_path = self.s3_hook.download_file(
                 key=s3_key, bucket_name=self.bucket, local_path=tmp_dir
             )
             pf = pq.ParquetFile(local_path)
             for batch in pf.iter_batches(batch_size=chunk_size):
                 yield batch.to_pandas()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def write_parquet(self, df: pd.DataFrame, s3_key: str) -> str:
         with tempfile.NamedTemporaryFile(dir=CFG.temp_dir, suffix=".parquet", delete=False) as tmp_file:
