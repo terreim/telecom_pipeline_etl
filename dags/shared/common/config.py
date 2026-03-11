@@ -93,6 +93,7 @@ class PipelineConfig:
     silver_prefix: str
     gold_prefix: str
     quarantine_prefix: str
+    metadata_prefix: str
 
     # Schema and table names
     schema_name: str
@@ -146,6 +147,7 @@ class PipelineConfig:
             silver_prefix=os.environ.get("SILVER_PREFIX", "silver"),
             gold_prefix=os.environ.get("GOLD_PREFIX", "gold"),
             quarantine_prefix=os.environ.get("QUARANTINE_PREFIX", "quarantine"),
+            metadata_prefix=os.environ.get("METADATA_PREFIX", "metadata"),
             schema_name=os.environ.get("SCHEMA_NAME", "telecom"),
             dim_dict=os.environ.get("DIM_DICT", "dict_station"),
             station_st=os.environ.get("STATION_ST", "subscriber_traffic"),

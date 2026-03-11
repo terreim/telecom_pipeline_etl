@@ -113,7 +113,7 @@ class S3WatermarkStore:
 
         # Duplicate another key but with timestaped history for audit
         self.mm.write_metadata(
-            key=f"metadata/watermark/{zone}/{table}/{datetime.utcnow().isoformat()}.json",
+            key=f"metadata/watermark/{zone}/{table}/{metadata['batch_id']}.json",
             metadata_dict=metadata,
         )
 

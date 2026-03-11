@@ -82,7 +82,7 @@ def sql_dim_station() -> str:
             lc.province, 
             lc.district,
             lc.region, 
-            lc.density,
+            lc.density_class,
             bs.technology
         FROM {CFG.schema_name}.{CFG.station_bs} bs
         LEFT JOIN {CFG.schema_name}.{CFG.station_op} op ON bs.operator_id = op.operator_id

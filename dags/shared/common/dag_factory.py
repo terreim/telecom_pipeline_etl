@@ -4,6 +4,7 @@ from typing import Callable
 
 from shared.common.config import CFG
 from shared.util.bronze_extractor import BronzeExtractor
+from shared.util.silver_transformer import SilverTransformer
 
 from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
@@ -92,7 +93,34 @@ class BronzeDag(DagFactory):
         return signal
 
 class SilverDag(DagFactory):
-    pass
+    def __init__(
+            self, 
+            start_date: datetime = datetime(2026, 1, 1),
+            catchup: bool = False,
+            max_active_runs: int = 1,
+            tags: list[str] = None,
+            postgres_conn_id: str = CFG.postgres_conn_id,
+        ):
+        super().__init__(start_date, catchup, max_active_runs, tags)
+        self.transformer = SilverTransformer(postgres_conn_id=postgres_conn_id)
+
+    def create_silver_task(
+            self, 
+            outlets: list[str],
+            bronze_table: str,
+            silver_subpath: str,
+            transform_fn: Callable,
+            lookback_hours=720
+        ) -> Callable:
+
+        @task(outlets=outlets, task_id=f"transform_{bronze_table}")
+        def transform(**context):
+            pending = self.transformer.find_unprocessed_hours(bronze_table, lookback_hours)
+            return [transform_fn(table_name=bronze_table, silver_subpath=silver_subpath,
+                                 batch_id=f"{bronze_table[:2]}_{context['run_id']}", lookback_range=lookback_hours)
+                    for _, __ in pending]
+        
+        return transform
 
 class GoldDag(DagFactory):
     pass

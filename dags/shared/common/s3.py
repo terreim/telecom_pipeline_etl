@@ -2,6 +2,7 @@
 Provides utilities for reading/writing Parquet files to S3 using Airflow's S3Hook.
 """
 
+import json
 import os
 import tempfile
 import logging
@@ -52,11 +53,17 @@ class S3IO:
         elif type == "key":
             return f"{prefix}/year={cutoff_time.year:04d}/month={cutoff_time.month:02d}/day={cutoff_time.day:02d}/hour={cutoff_time.hour:02d}/{filename}"
         
+    # =========================================================================
+    # Parquet
+    # =========================================================================
+
     def list_parquet_keys(self, prefix: str) -> list[str]:
         keys = self.s3_hook.list_keys(bucket_name=self.bucket, prefix=prefix) or []
         return [k for k in keys if k.endswith('.parquet')]
     
     def upload_parquet(self, tmp_path: str, s3_key: str):
+        if os.path.getsize(tmp_path) == 0:
+            raise ValueError(f"Refusing to upload 0-byte parquet to {s3_key}")
         self.s3_hook.load_file(
             filename=tmp_path, key=s3_key,
             bucket_name=self.bucket, replace=True,
@@ -68,6 +75,9 @@ class S3IO:
             local_path = self.s3_hook.download_file(
                 key=s3_key, bucket_name=self.bucket, local_path=tmp_dir
             )
+            logger.debug(f"download_file returned path: {local_path}, size: {os.path.getsize(local_path)}, dir contents: {os.listdir(tmp_dir)}")
+            if os.path.getsize(local_path) == 0:
+                raise ValueError(f"Downloaded parquet is 0 bytes: s3://{self.bucket}/{s3_key} -> {local_path}")
             return pd.read_parquet(local_path)
 
     def read_parquet_chunked(
@@ -93,6 +103,8 @@ class S3IO:
         try:
             table_pa = pa.Table.from_pandas(df, preserve_index=False)
             pq.write_table(table_pa, tmp_path, compression="SNAPPY")
+            if os.path.getsize(tmp_path) == 0:
+                raise ValueError(f"Parquet serialized to 0 bytes for key {s3_key} — df shape: {df.shape}, dtypes: {df.dtypes.to_dict()}")
             self.s3_hook.load_file(
                 filename=tmp_path, key=s3_key,
                 bucket_name=self.bucket, replace=True,
@@ -103,29 +115,14 @@ class S3IO:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-    # def write_success_marker(self, prefix: str) -> str:
-    #     """Write a _SUCCESS marker file (Spark/Hive convention) to indicate
-    #     that all files in a partition have been written successfully."""
-    #     marker_key = f"{prefix}_SUCCESS"
-    #     self.s3_hook.load_string(
-    #         string_data='',
-    #         key=marker_key,
-    #         bucket_name=self.bucket,
-    #         replace=True,
-    #     )
-    #     logger.info(f"Wrote _SUCCESS marker: {marker_key}")
-    #     return marker_key
+    # =========================================================================
+    # Json Metadata
+    # =========================================================================
 
-    # def has_success_marker(self, prefix: str) -> bool:
-    #     """Check if a _SUCCESS marker exists under the given prefix."""
-    #     marker_key = f"{prefix}_SUCCESS"
-    #     return self.s3_hook.check_for_key(key=marker_key, bucket_name=self.bucket)
-
-    # def delete_success_marker(self, prefix: str) -> bool:
-    #     """Delete the _SUCCESS marker if it exists. Returns True if deleted."""
-    #     marker_key = f"{prefix}_SUCCESS"
-    #     if self.s3_hook.check_for_key(key=marker_key, bucket_name=self.bucket):
-    #         self.s3_hook.delete_objects(bucket=self.bucket, keys=[marker_key])
-    #         logger.info(f"Deleted _SUCCESS marker: {marker_key}")
-    #         return True
-    #     return False
+    def list_json_keys(self, prefix: str) -> list[str]:
+        keys = self.s3_hook.list_keys(bucket_name=self.bucket, prefix=prefix) or []
+        return [k for k in keys if k.endswith('.json')]
+    
+    def read_json(self, s3_key: str) -> dict:
+        obj = self.s3_hook.get_key(key=s3_key, bucket_name=self.bucket)
+        return json.loads(obj.get()['Body'].read())

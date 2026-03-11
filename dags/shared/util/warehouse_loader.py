@@ -90,13 +90,13 @@ class ClickHouseLoader:
         records = dim_df.to_dict(orient='records')
         current_timestamp = pd.Timestamp.now(tz='UTC')
         records = [(r['station_id'], r['station_code'], r['operator_code'], r['operator_name'], 
-                    r['province'], r['district'], r['region'], r['density'], r['technology'], current_timestamp) 
+                    r['province'], r['district'], r['region'], r['density_class'], r['technology'], current_timestamp) 
                    for r in records]
 
         self.ch_hook.execute(f"""
                 INSERT INTO {schema}.{table_name} 
                     (station_id, station_code, operator_code, operator_name, 
-                    province, district, region, density, technology, updated_at)
+                    province, district, region, density_class, technology, updated_at)
                 VALUES""", params=records)
         
         self.ch_hook.execute(f"OPTIMIZE TABLE {schema}.{table_name} FINAL")
