@@ -2,7 +2,7 @@
 Manages watermarks for ELT batches.
 
 Each table has one current watermark file at:
-    metadata/watermark/{zone}/{table}/_metadata.json
+    metadata/watermark/{layer}/{table}/_metadata.json
 
 Three scenarios on get_watermark:
     1. No data in source yet          → initial_watermark=None, is_first_run=True
@@ -12,11 +12,9 @@ Three scenarios on get_watermark:
 
 import logging
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from shared.common.metadata import MetadataManager
 
 logger = logging.getLogger(__name__)
-
 
 class S3WatermarkStore:
     def __init__(self, metadata_manager: MetadataManager):
@@ -24,14 +22,14 @@ class S3WatermarkStore:
 
     # ── Key helper ────────────────────────────────────────────────────────────
 
-    def _watermark_key(self, zone: str, table: str) -> str:
-        return f"metadata/watermark/{zone}/{table}/_latest.json"
+    def _watermark_key(self, layer: str, table: str) -> str:
+        return f"metadata/watermark/{layer}/{table}/_latest.json"
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
     def get_watermark(
         self,
-        zone: str,
+        layer: str,
         table: str,
         elt_now: datetime,
         buffer_seconds: int,
@@ -48,7 +46,7 @@ class S3WatermarkStore:
         max_window_seconds caps the extraction window to prevent OOM
         on gap recovery after outages.
         """
-        prev_batch = self.mm.read_metadata(self._watermark_key(zone, table))
+        prev_batch = self.mm.read_metadata(self._watermark_key(layer, table))
         # Ensure elt_now is timezone-aware (UTC)
         if elt_now.tzinfo is None:
             elt_now = elt_now.replace(tzinfo=timezone.utc)
@@ -103,22 +101,22 @@ class S3WatermarkStore:
 
     def set_watermark(
         self,
-        zone: str,
+        layer: str,
         table: str,
         metadata: dict,
     ) -> None:
         """
-        Persists the watermark metadata for a given zone and table.
+        Persists the watermark metadata for a given layer and table.
         """
 
         # Duplicate another key but with timestaped history for audit
         self.mm.write_metadata(
-            key=f"metadata/watermark/{zone}/{table}/{metadata['batch_id']}.json",
+            key=f"metadata/watermark/{layer}/{table}/{metadata['batch_id']}.json",
             metadata_dict=metadata,
         )
 
         # Write _latest.json
         self.mm.write_metadata(
-            key=self._watermark_key(zone, table),
+            key=self._watermark_key(layer, table),
             metadata_dict=metadata,
         )

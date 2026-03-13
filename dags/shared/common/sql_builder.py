@@ -152,7 +152,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
             dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'operator_code', t.station_id) AS operator_code,
             dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'province', t.station_id) AS province,
             dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'region', t.station_id) AS region,
-            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'density', t.station_id) AS density,
+            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'density_class', t.station_id) AS density_class,
             dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'technology', t.station_id) AS technology,
                         
             count() AS session_count,
@@ -215,7 +215,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
             WHERE t.event_time >= '{hour_start}' AND t.event_time <= '{hour_end}'
             GROUP BY
                 station_id, hour_start, station_code, operator_code,
-                province, region, density, technology,
+                province, region, density_class, technology,
                 m.avg_cpu, m.max_cpu, m.avg_memory, m.avg_temp,
                 m.max_temp, m.avg_throughput, m.error_count,
                 e.alarm_count, e.warning_count, e.critical_count,
@@ -235,7 +235,7 @@ def sql_gold_slac_hourly(year: int, month: int, day: int) -> str:
                 operator_code,
                 province,
                 region,
-                density,
+                density_class,
                 technology,
                 count() AS total_hours,
                 countIf(health_category IS NOT NULL) AS active_hours,
@@ -248,7 +248,7 @@ def sql_gold_slac_hourly(year: int, month: int, day: int) -> str:
                 countIf(health_score < 30) AS hours_below_30
             FROM {CFG.schema_name}.{CFG.station_health}
             WHERE toDate(hour_start) = '{report_date}'
-            GROUP BY station_id, station_code, report_date, operator_code, province, region, density, technology
+            GROUP BY station_id, station_code, report_date, operator_code, province, region, density_class, technology
         ),
         sla_calc AS (
             SELECT 
@@ -270,7 +270,7 @@ def sql_gold_slac_hourly(year: int, month: int, day: int) -> str:
             sc.operator_code,
             sc.province,
             sc.region,
-            sc.density,
+            sc.density_class,
             sc.technology,
             sc.total_hours,
             sc.active_hours,
@@ -538,6 +538,68 @@ def sql_gold_region_report(year: int, month: int, day: int) -> str:
                 AND ha.province = sla.province 
                 AND ha.operator_code = sla.operator_code 
                 AND ha.technology = sla.technology
+    """
+
+def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
+    report_date = f"{year:04d}-{month:02d}-{day:02d}"
+    
+    return f"""
+        WITH 
+        maint_starts AS (
+            SELECT
+                station_id,
+                event_time AS maintenance_start,
+                metadata AS start_meta,
+                row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
+            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            WHERE event_type = 'maintenance_start'
+                AND toDate(event_time) = '{report_date}'
+        ),
+        maint_ends AS (
+            SELECT
+                station_id,
+                event_time AS maintenance_end,
+                metadata AS end_meta,
+                row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
+            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            WHERE event_type = 'maintenance_end'
+                AND toDate(event_time) >= '{report_date}'
+                AND toDate(event_time) <= toDate('{report_date}') + 1
+        ),
+        maint_pairs AS (
+            SELECT
+                s.station_id,
+                s.maintenance_start,
+                e.maintenance_end,
+                s.start_meta,
+                e.end_meta
+            FROM maint_starts s
+            LEFT JOIN maint_ends e ON s.station_id = e.station_id AND s.rn = e.rn
+        )
+
+        SELECT
+            mp.station_id,
+            dictGet('telecom.dict_station', 'station_code', mp.station_id) AS station_code,
+            dictGet('telecom.dict_station', 'operator_code', mp.station_id) AS operator_code,
+            dictGet('telecom.dict_station', 'region', mp.station_id) AS region,
+            dictGet('telecom.dict_station', 'technology', mp.station_id) AS technology,
+            mp.maintenance_start,
+            mp.maintenance_end,
+            JSONExtractInt(mp.start_meta::String, 'planned_duration_min') AS planned_duration_min,
+            dateDiff('minute', mp.maintenance_start, coalesce(mp.maintenance_end, now())) AS actual_duration_min,
+            dateDiff('minute', mp.maintenance_start, coalesce(mp.maintenance_end, now()))
+                - JSONExtractInt(mp.start_meta::String, 'planned_duration_min') AS overrun_min,
+            JSONExtractBool(mp.start_meta::String, 'tech_upgrade') AS tech_upgrade,
+            JSONExtractBool(mp.start_meta::String, 'sla_excluded') AS sla_excluded,
+            h_before.health_score AS pre_maintenance_health,
+            h_after.health_score AS post_maintenance_health
+        FROM maint_pairs mp
+        LEFT JOIN {CFG.schema_name}.{CFG.station_health} h_before
+            ON mp.station_id = h_before.station_id
+            AND h_before.hour_start = toStartOfHour(mp.maintenance_start) - INTERVAL 1 HOUR
+        LEFT JOIN {CFG.schema_name}.{CFG.station_health} h_after
+            ON mp.station_id = h_after.station_id
+            AND h_after.hour_start = toStartOfHour(coalesce(mp.maintenance_end, now())) + INTERVAL 1 HOUR
     """
 
 def sql_gold_handover_report(year: int, month: int, day: int) -> str:

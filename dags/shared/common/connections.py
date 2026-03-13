@@ -13,10 +13,20 @@ from contextlib import contextmanager
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+# Hooks 
+def get_postgres_hook(conn_id: str) -> PostgresHook:
+    return PostgresHook(postgres_conn_id=conn_id)
 
 def get_s3_hook(conn_id: str) -> S3Hook:
     return S3Hook(aws_conn_id=conn_id)
 
+def get_clickhouse_hook(conn_id: str) -> ClickHouseHook:
+    return ClickHouseHook(clickhouse_conn_id=conn_id)
+
+
+# Helpers
 def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
     s3_hook = get_s3_hook(conn_id=conn_id)
     
@@ -32,9 +42,6 @@ def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
     s3_endpoint = conn.extra_dejson.get("endpoint_url", "http://minio:9000")
 
     return (s3_access_key, s3_secret_key, s3_endpoint)
-
-def get_postgres_hook(conn_id: str) -> PostgresHook:
-    return PostgresHook(postgres_conn_id=conn_id)
 
 @contextmanager
 def pg_cursor(pg_hook: PostgresHook):

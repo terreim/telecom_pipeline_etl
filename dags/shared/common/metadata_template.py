@@ -64,3 +64,27 @@ def silver_metadata_template() -> dict:
 
 def gold_metadata_template() -> dict:
     pass
+
+def failure_metadata_template() -> dict:
+    """
+    Returns a template for failure metadata dicts. Callers should not mutate this directly;
+    import and call this function to get a fresh dict, then customize and write it.
+    """
+    return {
+        "schema_version": 1,
+        "layer": None,
+        "status": "failed",
+        "table": None,
+        "silver_subpath": None,
+        "gold_subpath": None,
+        "batch_id": None,
+        "stage": None,
+        "source_key": None,
+        "bronze_metadata_key": None,
+        "silver_metadata_key": None,
+        "error_type": None,
+        "error_message": None,
+        "traceback": None,
+        "remote_size_bytes": None,
+        "created_at": None,
+    }

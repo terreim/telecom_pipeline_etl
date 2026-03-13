@@ -13,6 +13,7 @@ SilverTransformer iterates over the metadata partition of each bronze tables, id
 import pandas as pd
 from datetime import datetime
 import time
+import re
 
 import logging
 from typing import Optional
@@ -23,13 +24,9 @@ from shared.common.connections import get_postgres_hook
 from shared.common.sql_builder import sql_dim_station
 from shared.common.metadata import MetadataManager
 from shared.common.metadata_template import silver_metadata_template
+from shared.common.failure_recovery import write_failure_metadata
 from shared.common.watermark import S3WatermarkStore
-from shared.common.validators import validate_traffic, validate_events, validate_metrics
-
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
-import re
+from shared.common.validators import validate_traffic, validate_events, validate_metrics, validate_station_dimension
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +35,7 @@ class SilverTransformer:
         self,
         s3_conn_id: str = CFG.s3_conn_id,
         s3_bucket: str = CFG.s3_bucket,
-        zone: str = CFG.silver_prefix,
+        layer: str = CFG.silver_prefix,
         postgres_conn_id: Optional[str] = None,
     ):
         self.s3_io = S3IO(s3_conn_id, s3_bucket)
@@ -47,7 +44,7 @@ class SilverTransformer:
         self._station_dim: Optional[pd.DataFrame] = None
         self.meta = MetadataManager(s3_bucket, conn_id=s3_conn_id)
         self.watermark_store = S3WatermarkStore(self.meta)
-        self.zone = zone
+        self.layer = layer
 
         self.silver_prefix = CFG.silver_prefix
         self.quarantine_prefix = CFG.quarantine_prefix
@@ -80,7 +77,8 @@ class SilverTransformer:
     def _validate_traffic(self, df: pd.DataFrame) -> pd.DataFrame: return validate_traffic(df)
     def _validate_metrics(self, df: pd.DataFrame) -> pd.DataFrame: return validate_metrics(df)
     def _validate_events(self, df: pd.DataFrame) -> pd.DataFrame:  return validate_events(df)
-
+    def _validate_station_dimension(self, df: pd.DataFrame) -> pd.DataFrame: return validate_station_dimension(df)
+    
     # =========================================================================
     # Transformations
     # =========================================================================
@@ -89,6 +87,7 @@ class SilverTransformer:
         station_dim = self._load_station_dimension()
         
         df = df.merge(station_dim, on='station_id', how='left', indicator='dim_match_status')
+        df = self._validate_station_dimension(df)
         df['dim_match_status'] = df['dim_match_status'].map({'both': 'matched', 'left_only': 'station_missing'})
         
         missing_count = (df['dim_match_status'] == 'station_missing').sum()
@@ -199,8 +198,25 @@ class SilverTransformer:
 
                 try:
                     df = self.s3_io.read_parquet(data_key)
-                except (ValueError, Exception) as e:
-                    logger.error(f"Skipping unreadable bronze file {data_key}: {e}")
+                except Exception as e:
+                    failure_key = write_failure_metadata(
+                        mm=self.meta,
+                        metadata_prefix=self.metadata_prefix,
+                        layer="silver",
+                        table_name=table_name,
+                        batch_id=batch_id,
+                        stage="read_bronze",
+                        source_key=data_key,
+                        source_metadata_key=meta_key,
+                        error=e,
+                        s3_hook=self.s3_io.s3_hook,
+                        s3_bucket=self.bucket,
+                        subpath=silver_subpath,
+                    )
+                    logger.error(
+                        f"Skipping unreadable bronze file {data_key}: {e}. "
+                        f"Failure metadata written to {failure_key}"
+                    )
                     continue
                 logger.info(f"Read {len(df)} records from {data_key}")
 
@@ -249,7 +265,7 @@ class SilverTransformer:
             silver_meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
 
             self.meta.write_metadata(
-                key=f"{self.metadata_prefix}/watermark/{self.zone}/{silver_subpath}/{batch_id}.json",
+                key=f"{self.metadata_prefix}/watermark/{self.layer}/{silver_subpath}/{batch_id}.json",
                 metadata_dict=silver_meta,
             )   
 

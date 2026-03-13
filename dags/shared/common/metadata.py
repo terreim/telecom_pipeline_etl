@@ -4,11 +4,8 @@ Each metadata file corresponds to an hour-partition of a specific table in bronz
 """
 
 import json
-import logging
 from shared.common.connections import get_s3_hook
 from shared.common.config import CFG
-
-# logger = logging.getLogger(__name__)
 
 class MetadataManager:
     def __init__(self, s3_bucket: str, conn_id: str = CFG.s3_conn_id):

@@ -117,14 +117,14 @@ class BronzeExtractor:
         postgres_conn_id: str = CFG.postgres_conn_id,
         s3_conn_id: str = CFG.s3_conn_id, 
         s3_bucket: str = CFG.s3_bucket, 
-        zone: str = CFG.bronze_prefix
+        layer: str = CFG.bronze_prefix
     ):
         self.pg_hook = get_postgres_hook(conn_id=postgres_conn_id)
         self.s3_io = S3IO(conn_id=s3_conn_id, bucket=s3_bucket)
         self.meta = MetadataManager(s3_bucket, conn_id=s3_conn_id)
         self.watermark_store = S3WatermarkStore(self.meta)
         self.bucket = s3_bucket
-        self.zone = zone
+        self.layer = layer
 
     def _get_initial_watermark(self, schema: str, table: str, mode: str, initial_wm: datetime | None = None) -> datetime | None:
         """Get the initial watermark for the table.
@@ -225,7 +225,7 @@ class BronzeExtractor:
             meta |= {"layer": "bronze", "table": table, "batch_id": batch_id_windowed, "dedup_key": [pk_column]}
 
             fr, n_fr, to, first, prev_bid = self.watermark_store.get_watermark(
-                zone=self.zone,
+                layer=self.layer,
                 table=table,
                 elt_now=elt_now,
                 buffer_seconds=CFG.buffer_seconds,
@@ -270,7 +270,7 @@ class BronzeExtractor:
             meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
             meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
             self.watermark_store.set_watermark(
-                zone=self.zone,
+                layer=self.layer,
                 table=table,
                 metadata=meta,
             )
@@ -290,7 +290,7 @@ class BronzeExtractor:
                     )
                     meta["status"] = "skipped"
                     meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-                    self.watermark_store.set_watermark(zone=self.zone, table=table, metadata=meta)
+                    self.watermark_store.set_watermark(layer=self.layer, table=table, metadata=meta)
                     break
                 
                 logger.info(f"No data in [{fr} → {to}], jumping to {next_data}")
@@ -299,7 +299,7 @@ class BronzeExtractor:
                 )
                 meta["status"] = "skipped"
                 meta["created_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-                self.watermark_store.set_watermark(zone=self.zone, table=table, metadata=meta)
+                self.watermark_store.set_watermark(layer=self.layer, table=table, metadata=meta)
                 windows_processed += 1
                 continue
         
@@ -417,7 +417,7 @@ class BronzeExtractor:
             
             is_chunked = total_rows > chunk_size
             
-            s3_key = self.s3_io.create_key(prefix=f"{self.zone}/{table}", table=table, cutoff_time=cutoff_time, filename=f"{batch_id}.parquet", type="key")
+            s3_key = self.s3_io.create_key(prefix=f"{self.layer}/{table}", table=table, cutoff_time=cutoff_time, filename=f"{batch_id}.parquet", type="compact_key")
             self.s3_io.ensure_bucket()
 
             self.s3_io.upload_parquet(tmp_path, s3_key)
@@ -529,7 +529,7 @@ class BronzeExtractor:
 
             for (y, m, d, h), entry in writers.items():
                 partition_ts = pd.Timestamp(year=y, month=m, day=d, hour=h)
-                s3_key = self.s3_io.create_key(prefix=f"{self.zone}/{table}", cutoff_time=partition_ts, filename=f"{batch_id}.parquet", type="key")
+                s3_key = self.s3_io.create_key(prefix=f"{self.layer}/{table}", cutoff_time=partition_ts, filename=f"{batch_id}.parquet", type="compact_key")
 
                 self.s3_io.upload_parquet(entry['tmp_path'], s3_key)
 
