@@ -60,3 +60,40 @@ class MetadataManager:
         Stateless — callers own their base dicts.
         """
         return {**base, **overrides}
+
+    def find_unprocessed(
+        self,
+        prefix: str,
+        flag: str,
+        lookback: int | None = None,
+        skip_latest: bool = True,
+    ) -> list[tuple[str, dict]]:
+        """Scan a metadata prefix and return (key, metadata) pairs where
+        *flag* is falsy (False, missing, or None).
+
+        Args:
+            prefix:       S3 key prefix to scan (e.g. "metadata/watermark/bronze/my_table/")
+            flag:         Metadata field to check (e.g. "loaded_to_silver")
+            lookback:     If set, only inspect the last N keys (by S3 list order).
+            skip_latest:  Skip keys ending with '_latest.json' (watermark pointers).
+        """
+        keys = self.s3_hook.list_keys(bucket_name=self.s3_bucket, prefix=prefix) or []
+        keys = [k for k in keys if k.endswith(".json")]
+        if skip_latest:
+            keys = [k for k in keys if not k.endswith("_latest.json")]
+        if lookback:
+            keys = keys[-lookback:]
+
+        unprocessed = []
+        for key in keys:
+            metadata = self.read_metadata(key)
+            if metadata is None:
+                continue
+            if not metadata.get(flag, False):
+                unprocessed.append((key, metadata))
+        return unprocessed
+
+    def mark_loaded(self, key: str, metadata: dict, flag: str) -> None:
+        """Set *flag* = True on *metadata* and persist it back to S3."""
+        metadata[flag] = True
+        self.write_metadata(key=key, metadata_dict=metadata)

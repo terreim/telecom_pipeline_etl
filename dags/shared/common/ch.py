@@ -39,6 +39,29 @@ class ClickHouseIO:
             params=[tuple(row) for _, row in df.iterrows()]
         )
 
+    def insert_with_fallback(
+        self,
+        df: pd.DataFrame,
+        s3_url: str,
+        ch_table: str,
+    ) -> None:
+        """INSERT via S3 function, falling back to VALUES if S3 insert fails.
+
+        Args:
+            df:        DataFrame to insert (used only for the VALUES fallback).
+            s3_url:    Full S3 URL already written by the caller (used for primary path).
+            ch_table:  ClickHouse table name (without schema prefix).
+        """
+        try:
+            self.insert_s3(url=s3_url, ch_table=ch_table)
+        except Exception as ex1:
+            logger.warning(f"S3 insert into {ch_table} failed ({ex1}), falling back to VALUES insert")
+            try:
+                self.insert_ch(df=df, ch_table=ch_table, columns=df.columns.tolist())
+            except Exception as ex2:
+                logger.error(f"VALUES insert into {ch_table} also failed: {ex2}")
+                raise ex2
+
     # def delete_gold_hour(self, y: int, m: int, d: int, h: int) -> None:
         #     """Delete gold CH data for a single hour (health + anomaly + health_daily MV)."""
         #     hour_start = f"{y:04d}-{m:02d}-{d:02d} {h:02d}:00:00"

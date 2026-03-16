@@ -2,26 +2,18 @@ from airflow.sdk import DAG, task
 from airflow.sdk import Asset, Metadata
 from airflow.exceptions import AirflowSkipException
 from datetime import datetime, timedelta
-import json
 
 from pendulum import now as pendulum_now
 
 from shared.common.config import CFG
-
+from shared.common.dag_defaults import GOLD_DEFAULTS
+from shared.common.dag_factory import GoldDag
 from shared.util.silver_transformer import SilverTransformer
 from shared.util.gold_aggregator import GoldAggregator
-from shared.util.warehouse_loader import ClickHouseLoader
+from telecom_pipeline_etl.dags.shared.util.staging_loader import ClickHouseLoader
 from silver_lake import staging_trigger_events, staging_trigger_metrics, staging_trigger_traffic
 
-default_args = {
-    "owner": "data-team", 
-    "retries": 50,
-    "retry_delay": timedelta(seconds=60),
-    # "retry_exponential_backoff": True,
-    "max_retry_delay": timedelta(minutes=10),
-    "execution_timeout": timedelta(minutes=30),
-    "sla": timedelta(hours=2),
-}
+default_args = GOLD_DEFAULTS
 
 gold_traffic_ready = Asset("signal://gold/traffic")
 gold_metrics_ready = Asset("signal://gold/metrics")
@@ -118,7 +110,7 @@ with DAG(
                     continue
                 loader.insert_silver_to_clickhouse(
                     s3_key=s3_key,
-                    staging_table=CFG.STATION_STAGING_PM,
+                    staging_table=CFG.station_staging_pm,
                 )
                 loaded += 1
         unique_hours = list(set(map(tuple, all_hours)))
@@ -153,7 +145,7 @@ with DAG(
                     continue
                 loader.insert_silver_to_clickhouse(
                     s3_key=s3_key,
-                    staging_table=CFG.STATION_STAGING_SE,
+                    staging_table=CFG.station_staging_se,
                 )
                 loaded += 1
         unique_hours = list(set(map(tuple, all_hours)))
@@ -241,6 +233,9 @@ with DAG(
 #                 region_daily
 # =============================================================================
 
+_gold = GoldDag(tags=['gold'])
+
+# health_hourly is special: manual backfill support + fires health_daily_ready
 with DAG(
     dag_id="gold_health_hourly",
     schedule=[gold_traffic_ready, gold_metrics_ready, gold_events_ready],
@@ -250,61 +245,45 @@ with DAG(
     tags=['gold', 'health', 'hourly'],
     default_args=default_args,
     params={
-        "trigger_time": "",       # ISO datetime e.g. "2026-02-25T14:00:00"
-        "lookback_hours": 1,      # hours back from trigger_time (manual only)
+        "trigger_time": "",   # ISO datetime e.g. "2026-02-25T14:00:00"
+        "lookback_hours": 1,  # hours back from trigger_time (manual only)
     },
 ) as dag:
-    
+
     @task(outlets=[health_hourly_ready, health_daily_ready])
     def compute_health_hourly(**context):
         aggregator = GoldAggregator()
-        
-        all_hours = set()
+        report = aggregator.reports()["health_hourly"]
 
-        for asset in [gold_traffic_ready, gold_metrics_ready, gold_events_ready]:
-            for event in context['triggering_asset_events'].get(asset, []):
+        all_hours = set()
+        for events in context['triggering_asset_events'].values():
+            for event in events:
                 for h in event.extra.get("hours", []):
                     all_hours.add(tuple(h))
 
-        # If manually triggering gold_health_hourly
         if not all_hours and context['run_id'].startswith('manual__'):
-            params = context['params']
-            trigger_str = params.get("trigger_time", "")
-
-            if trigger_str:
-                anchor = datetime.fromisoformat(trigger_str)
-            else:
-                anchor = pendulum_now()
-
-            lookback = int(params.get("lookback_hours", 1))
-            for i in range(lookback):
+            trigger_str = context['params'].get("trigger_time", "")
+            anchor = datetime.fromisoformat(trigger_str) if trigger_str else pendulum_now()
+            for i in range(int(context['params'].get("lookback_hours", 1))):
                 ts = anchor - timedelta(hours=i)
                 all_hours.add((ts.year, ts.month, ts.day, ts.hour))
 
-        results = []
-        for year, month, day, hour in all_hours:
-            result = aggregator.gold_health_hourly(year=year, month=month, day=day, hour=hour)
-            results.append(result)
-        
+        results = [
+            aggregator.aggregate(report, year, month, day, hour)
+            for year, month, day, hour in sorted(all_hours)
+        ]
+
         yield Metadata(asset=health_hourly_ready, extra={"hours": [list(h) for h in all_hours]})
 
-        # Collect all unique days that need daily aggregation:
-        # - hour 23 means the day is fully complete (streaming mode)
-        # - manual backfill: every day in the range
-        daily_days = set()
         is_manual = context['run_id'].startswith('manual__')
-        for y, m, d, h in all_hours:
-            if h == 23 or is_manual:
-                daily_days.add((y, m, d))
-
+        daily_days = {(y, m, d) for y, m, d, h in all_hours if h == 23 or is_manual}
         if daily_days:
-            yield Metadata(asset=health_daily_ready, extra={
-                "days": [list(d) for d in sorted(daily_days)],
-            })
+            yield Metadata(asset=health_daily_ready, extra={"days": [list(d) for d in sorted(daily_days)]})
 
         return results
-    
+
     compute_health_hourly()
+
 
 with DAG(
     dag_id="gold_anomaly_features",
@@ -315,26 +294,10 @@ with DAG(
     tags=['gold', 'anomaly', 'hourly'],
     default_args=default_args,
 ) as dag:
-    
-    @task
-    def compute_anomaly_features(**context):
-        aggregator = GoldAggregator()
-        hours = set()
+    _gold.create_hourly_task("anomaly_features")()
 
-        for event in context['triggering_asset_events'].get(health_hourly_ready, []):
-            for h in event.extra.get("hours", []):
-                hours.add(tuple(h))
-        
-        results = []
-        for year, month, day, hour in hours:
-            result = aggregator.gold_anomaly_features(year=year, month=month, day=day, hour=hour)
-            results.append(result)
-        
-        return results
 
-    compute_anomaly_features()
-
-with DAG( 
+with DAG(
     dag_id="gold_sla_compliance",
     schedule=[health_daily_ready],
     start_date=datetime(2026, 1, 1),
@@ -343,26 +306,25 @@ with DAG(
     tags=['gold', 'sla', 'compliance'],
     default_args=default_args,
 ) as dag:
-    
+
     @task(outlets=[sla_ready])
     def compute_sla_compliance(**context):
         aggregator = GoldAggregator()
+        report = aggregator.reports()["sla_compliance"]
 
-        all_days = set()
-        for event in context['triggering_asset_events'].get(health_daily_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
+        days = set()
+        for events in context['triggering_asset_events'].values():
+            for event in events:
+                for d in event.extra.get("days", []):
+                    days.add(tuple(d))
 
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_sla_compliance(year=year, month=month, day=day)
-            results.append(result)
-
-        yield Metadata(asset=sla_ready, extra={"days": [list(d) for d in sorted(all_days)]})
+        results = [aggregator.aggregate(report, y, m, d) for y, m, d in sorted(days)]
+        yield Metadata(asset=sla_ready, extra={"days": [list(d) for d in sorted(days)]})
         return results
 
     compute_sla_compliance()
-    
+
+
 with DAG(
     dag_id="gold_region_daily",
     schedule=[sla_ready],
@@ -372,128 +334,23 @@ with DAG(
     tags=['gold', 'region', 'daily'],
     default_args=default_args,
 ) as dag:
-    
-    @task
-    def compute_region_daily(**context):
-        aggregator = GoldAggregator()
+    _gold.create_daily_task("region_daily")()
 
-        all_days = set()
-        for event in context['triggering_asset_events'].get(sla_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
 
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_region_daily(year=year, month=month, day=day)
-            results.append(result)
-        return results
-
-    compute_region_daily()
-
-with DAG(
-    dag_id="gold_outage_report",
-    schedule=[health_daily_ready],
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    max_active_runs=1,
-    tags=['gold', 'outage', 'report'],
-    default_args=default_args,
-) as dag:
-    
-    @task
-    def compute_outage_report(**context):
-        aggregator = GoldAggregator()
-
-        all_days = set()
-        for event in context['triggering_asset_events'].get(health_daily_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
-
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_outage_report(year=year, month=month, day=day)
-            results.append(result)
-        return results
-
-    compute_outage_report()
-    
-with DAG(   
-    dag_id="gold_maintenance_report",
-    schedule=[health_daily_ready],
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    max_active_runs=1,
-    tags=['gold', 'maintenance', 'report'],
-    default_args=default_args,
-) as dag:
-    
-    @task
-    def compute_maintenance_report(**context):
-        aggregator = GoldAggregator()
-
-        all_days = set()
-        for event in context['triggering_asset_events'].get(health_daily_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
-
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_maintenance_report(year=year, month=month, day=day)
-            results.append(result)
-        return results
-    
-    compute_maintenance_report()
-
-with DAG(
-    dag_id="gold_handover_report",
-    schedule=[health_daily_ready],
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    max_active_runs=1,
-    tags=['gold', 'handover', 'report'],
-    default_args=default_args,
-) as dag:
-    
-    @task
-    def compute_handover_report(**context):
-        aggregator = GoldAggregator()
-
-        all_days = set()
-        for event in context['triggering_asset_events'].get(health_daily_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
-
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_handover_report(year=year, month=month, day=day)
-            results.append(result)
-        return results
-    
-    compute_handover_report()
-
-with DAG(
-    dag_id="gold_alarm_report",
-    schedule=[health_daily_ready],
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    max_active_runs=1,
-    tags=['gold', 'alarm', 'report'],
-    default_args=default_args,
-) as dag:
-    
-    @task
-    def compute_alarm_report(**context):
-        aggregator = GoldAggregator()
-
-        all_days = set()
-        for event in context['triggering_asset_events'].get(health_daily_ready, []):
-            for d in event.extra.get("days", []):
-                all_days.add(tuple(d))
-
-        results = []
-        for year, month, day in sorted(all_days):
-            result = aggregator.gold_alarm_report(year=year, month=month, day=day)
-            results.append(result)
-        return results
-    
-    compute_alarm_report()
+# Daily reports that all fan out from health_daily_ready
+for _report_name, _tags in [
+    ("outage_report",       ['gold', 'outage',       'report']),
+    ("maintenance_report",  ['gold', 'maintenance',  'report']),
+    ("handover_daily",      ['gold', 'handover',     'daily']),
+    ("alarm_daily",         ['gold', 'alarm',        'daily']),
+]:
+    with DAG(
+        dag_id=f"gold_{_report_name}",
+        schedule=[health_daily_ready],
+        start_date=datetime(2026, 1, 1),
+        catchup=False,
+        max_active_runs=1,
+        tags=_tags,
+        default_args=default_args,
+    ) as dag:
+        _gold.create_daily_task(_report_name)()

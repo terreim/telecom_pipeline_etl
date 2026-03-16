@@ -97,6 +97,7 @@ class PipelineConfig:
 
     # Schema and table names
     schema_name: str
+    dim_station: str
     dim_dict: str
 
     # Bronze
@@ -149,6 +150,7 @@ class PipelineConfig:
             quarantine_prefix=os.environ.get("QUARANTINE_PREFIX", "quarantine"),
             metadata_prefix=os.environ.get("METADATA_PREFIX", "metadata"),
             schema_name=os.environ.get("SCHEMA_NAME", "telecom"),
+            dim_station=os.environ.get("DIM_STATION", "dim_station"),
             dim_dict=os.environ.get("DIM_DICT", "dict_station"),
             station_st=os.environ.get("STATION_ST", "subscriber_traffic"),
             station_bs=os.environ.get("STATION_BS", "base_station"),

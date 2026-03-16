@@ -13,14 +13,14 @@ Functions:
         Generates a SELECT query joining base station, operator, and location
         dimension tables to produce a unified station dimension view.
     
+    sql_ch_dim_station() -> str
+        Generates a SELECT query to create a ClickHouse dictionary for station
+        dimension, used for efficient lookups in Gold-layer queries.
+
     **Bronze Layer:**
     sql_bronze_extractor(table_name, columns) -> str
         Generates a parameterized SELECT for incremental extraction from a
         source table, filtered by `updated_at` timestamps (expects %s placeholders).
-    
-    sql_silver_staging(table_name, s3_endpoint, s3_bucket, s3_key, s3_access_key, s3_secret_key) -> str
-        Generates an INSERT ... SELECT from an S3-backed Parquet file into a
-        ClickHouse staging table.
     
     **Recovery/Catchup:**
     sql_generic_clear_range(table_name, date_column, start, end) -> str
@@ -89,6 +89,43 @@ def sql_dim_station() -> str:
         LEFT JOIN {CFG.schema_name}.{CFG.station_lc} lc ON bs.location_id = lc.location_id
     """
 
+def sql_ch_dim_station() -> str:
+    return f"""
+        CREATE TABLE IF NOT EXISTS {CFG.schema_name}.{CFG.dim_station} (
+            station_id UInt32,
+            station_code String,
+            operator_code String,
+            operator_name String,
+            province String,
+            district String,
+            region String,
+            density_class String,
+            technology String,
+            updated_at DateTime
+        ) ENGINE = ReplacingMergeTree(updated_at)
+        PRIMARY KEY station_id
+    """
+
+def sql_ch_dim_dict() -> str:
+    return f"""
+        CREATE DICTIONARY IF NOT EXISTS {CFG.schema}.{CFG.dim_dict}
+        (
+            `station_id` UInt32,
+            `station_code` String,
+            `operator_code` String,
+            `operator_name` String,
+            `province` String,
+            `district` String,
+            `region` String,
+            `density_class` String,
+            `technology` String
+        )
+        PRIMARY KEY station_id
+        SOURCE(CLICKHOUSE(TABLE '{CFG.dim_station}' DB '{CFG.schema}'))
+        LIFETIME(MIN 300 MAX 600)
+        LAYOUT(FLAT());
+    """
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Bronze layer template
 # ══════════════════════════════════════════════════════════════════════════════
@@ -101,21 +138,6 @@ def sql_bronze_extractor(table_name: str, columns: list[str], overlap: int, buff
             AND updated_at <= %(max_updated_at)s
         ORDER BY updated_at ASC, {pk_column} ASC
         """
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Silver staging templates
-# ══════════════════════════════════════════════════════════════════════════════
-
-def sql_silver_staging(table_name: str, s3_endpoint: str, s3_bucket: str, s3_key: str, s3_access_key: str, s3_secret_key: str) -> str:
-    return f"""
-        INSERT INTO {CFG.schema_name}.{table_name}
-        SELECT * FROM s3(
-            '{s3_endpoint}/{s3_bucket}/{s3_key}',
-            '{s3_access_key}',
-            '{s3_secret_key}',
-            'Parquet'
-        )
-        SETTINGS use_hive_partitioning=0"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Recovery and Catchup templates
@@ -191,6 +213,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
                     max(error_count) AS error_count
                 FROM {CFG.schema_name}.{CFG.station_staging_pm}
                 WHERE metric_time >= '{hour_start}' AND metric_time <= '{hour_end}'
+                    AND is_deleted = false
                 GROUP BY station_id
             ) m ON t.station_id = m.station_id
             LEFT JOIN (
@@ -209,10 +232,12 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
                     max(event_type = 'maintenance_start') AS maintenance_active
                 FROM {CFG.schema_name}.{CFG.station_staging_se}
                 WHERE event_time >= '{hour_start}' AND event_time <= '{hour_end}'
+                    AND is_deleted = false
                 GROUP BY station_id
             ) e ON t.station_id = e.station_id
 
             WHERE t.event_time >= '{hour_start}' AND t.event_time <= '{hour_end}'
+                AND t.is_deleted = false
             GROUP BY
                 station_id, hour_start, station_code, operator_code,
                 province, region, density_class, technology,
@@ -309,6 +334,7 @@ def sql_gold_slac_hourly(year: int, month: int, day: int) -> str:
                 avgIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS mttr_min
             FROM {CFG.schema_name}.{CFG.station_staging_se}
             WHERE toDate(event_time) = '{report_date}'
+                AND is_deleted = false
             GROUP BY station_id, event_date
         ) e ON sc.station_id = e.station_id AND e.event_date = sc.report_date
     """
@@ -389,6 +415,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
             FROM {CFG.schema_name}.{CFG.station_staging_se}
             WHERE event_type = 'incident_start'
                 AND toDate(event_time) = '{report_date}'
+                AND is_deleted = false
         ),
         ends AS (
             SELECT
@@ -400,6 +427,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
             WHERE event_type = 'incident_end'
                 AND toDate(event_time) >= '{report_date}'
                 AND toDate(event_time) <= toDate('{report_date}') + 1
+                AND is_deleted = false
         ),
         incident_pairs AS (
             SELECT
@@ -425,6 +453,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
                 AND st.event_time >= ip.incident_start
                 AND st.event_time <= coalesce(ip.incident_end, now())
             WHERE toDate(st.event_time) >= '{report_date}'
+                AND st.is_deleted = false
             GROUP BY ip.station_id, ip.incident_start
         ),
 
@@ -451,6 +480,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
             FROM {CFG.schema_name}.{CFG.station_staging_st}
             WHERE toDate(event_time) >= '{baseline_start}'
                 AND toDate(event_time) < '{report_date}'
+                AND is_deleted = false
             GROUP BY station_id, hour_of_day
         )
 
@@ -554,6 +584,7 @@ def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
             FROM {CFG.schema_name}.{CFG.station_staging_se}
             WHERE event_type = 'maintenance_start'
                 AND toDate(event_time) = '{report_date}'
+                AND is_deleted = false
         ),
         maint_ends AS (
             SELECT
@@ -565,6 +596,7 @@ def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
             WHERE event_type = 'maintenance_end'
                 AND toDate(event_time) >= '{report_date}'
                 AND toDate(event_time) <= toDate('{report_date}') + 1
+                AND is_deleted = false
         ),
         maint_pairs AS (
             SELECT
@@ -628,6 +660,7 @@ def sql_gold_handover_report(year: int, month: int, day: int) -> str:
                 avg(latency_ms) AS avg_latency
             FROM {CFG.schema_name}.{CFG.station_staging_st}
             WHERE toDate(event_time) = '{report_date}'
+                AND is_deleted = false
             GROUP BY station_id, traffic_date
         ) src_traffic 
             ON e.station_id = src_traffic.station_id
@@ -639,11 +672,13 @@ def sql_gold_handover_report(year: int, month: int, day: int) -> str:
                 avg(latency_ms) AS avg_latency
             FROM {CFG.schema_name}.{CFG.station_staging_st}
             WHERE toDate(event_time) = '{report_date}'
+                AND is_deleted = false
             GROUP BY station_id, traffic_date
         ) tgt_traffic 
             ON e.target_station_id = tgt_traffic.station_id
             AND toDate(e.event_time) = tgt_traffic.traffic_date
         WHERE e.event_type = 'handover'
+            AND e.is_deleted = false
             AND toDate(e.event_time) = '{report_date}'
             AND e.target_station_id IS NOT NULL
             AND e.target_station_id != 0
@@ -670,6 +705,7 @@ def sql_gold_alarm_report(year: int, month: int, day: int) -> str:
             FROM {CFG.schema_name}.{CFG.station_staging_se}
             WHERE event_type = 'alarm'
                 AND toDate(event_time) = '{report_date}'
+                AND is_deleted = false
             GROUP BY report_date, station_id
         )
         SELECT

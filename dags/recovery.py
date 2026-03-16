@@ -20,7 +20,7 @@ from airflow.exceptions import AirflowSkipException
 from datetime import datetime, timedelta
 
 from shared.common.config import CFG
-from shared.util.warehouse_loader import ClickHouseLoader
+from telecom_pipeline_etl.dags.shared.util.staging_loader import ClickHouseLoader
 from shared.util.gold_aggregator import GoldAggregator
 
 import logging
@@ -34,9 +34,9 @@ default_args = {
 }
 
 ALL_SILVER_SUBPATHS = {
-    CFG.STATION_CLEANED_ST: CFG.STATION_STAGING_ST,
-    CFG.STATION_CLEANED_PM: CFG.STATION_STAGING_PM,
-    CFG.STATION_CLEANED_SE: CFG.STATION_STAGING_SE,
+    CFG.station_cleaned_st: CFG.station_staging_st,
+    CFG.station_cleaned_pm: CFG.station_staging_pm,
+    CFG.station_cleaned_se: CFG.station_staging_se,
 }
 
 # =============================================================================

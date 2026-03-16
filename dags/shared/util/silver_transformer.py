@@ -87,7 +87,7 @@ class SilverTransformer:
         station_dim = self._load_station_dimension()
         
         df = df.merge(station_dim, on='station_id', how='left', indicator='dim_match_status')
-        df = self._validate_station_dimension(df)
+        self._validate_station_dimension(df)
         df['dim_match_status'] = df['dim_match_status'].map({'both': 'matched', 'left_only': 'station_missing'})
         
         missing_count = (df['dim_match_status'] == 'station_missing').sum()
@@ -120,37 +120,30 @@ class SilverTransformer:
     # Helper Methods
     # =========================================================================
 
-    def find_unprocessed_hours(
-            self, 
+    def find_unprocessed_bronze(
+            self,
             bronze_table: str,
-            lookback_range: int | None = '',
+            lookback_range: int | None = None,
         ) -> list[tuple[str, dict]]:
-
-        metadata_keys = self.s3_io.list_json_keys(
-            prefix=f"{self.metadata_prefix}/watermark/bronze/{bronze_table}/"
+        """Scan bronze metadata for json files with unmarked `loaded_to_silver`."""
+        prefix = f"{self.metadata_prefix}/watermark/bronze/{bronze_table}/"
+        candidates = self.meta.find_unprocessed(
+            prefix=prefix,
+            flag="loaded_to_silver",
+            lookback=lookback_range,
         )
 
-        logger.info(f"Found {len(metadata_keys)} metadata files for bronze table {bronze_table}")
-
+        # Skip bronze batches that were skipped or have no data_keys —
+        # mark them loaded_to_silver so they don't reappear on every scan.
         unprocessed = []
-        for key in metadata_keys[-lookback_range:]:
-            if key.endswith('_latest.json'):
-                continue
-            metadata = self.s3_io.read_json(key)
-            if metadata.get('loaded_to_silver', False):
-                continue
-
-            # Skip bronze batches that were skipped or have no data_keys —
-            # mark them loaded_to_silver so they don't reappear on every scan.
+        for key, metadata in candidates:
             if metadata.get('status') == 'skipped' or not metadata.get('data_keys'):
                 logger.info(f"Marking empty/skipped bronze batch as loaded_to_silver: {key}")
-                metadata['loaded_to_silver'] = True
-                self.meta.write_metadata(key=key, metadata_dict=metadata)
+                self.meta.mark_loaded(key, metadata, "loaded_to_silver")
                 continue
-
             unprocessed.append((key, metadata))
 
-        logger.info(f"Identified {len(unprocessed)} unprocessed metadata entries for bronze table {bronze_table}")
+        logger.info(f"Identified {len(unprocessed)} unprocessed bronze entries for {bronze_table}")
         return unprocessed
     
     def _extract_partition(self, s3_key: str) -> str:
@@ -170,7 +163,7 @@ class SilverTransformer:
         add_derived_fn,
         batch_id: str,
         lookback_range: int = 720,
-    ) -> dict:
+    ) -> list[dict]:
         """Generic transform pipeline.
 
         Processes each bronze file **individually** — read, validate, enrich,
@@ -179,7 +172,7 @@ class SilverTransformer:
         """
         all_results = []
 
-        for meta_key, bronze_meta in self.find_unprocessed_hours(bronze_table=table_name, lookback_range=lookback_range):
+        for meta_key, bronze_meta in self.find_unprocessed_bronze(bronze_table=table_name, lookback_range=lookback_range):
             t0 = time.monotonic()
             silver_meta = silver_metadata_template()
             silver_meta['table'] = silver_subpath
@@ -265,12 +258,11 @@ class SilverTransformer:
             silver_meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
 
             self.meta.write_metadata(
-                key=f"{self.metadata_prefix}/watermark/{self.layer}/{silver_subpath}/{batch_id}.json",
+                key=f"{self.metadata_prefix}/watermark/{self.layer}/{silver_subpath}/{partition.replace('/', '_')}.json",
                 metadata_dict=silver_meta,
             )   
 
-            bronze_meta["loaded_to_silver"] = True
-            self.meta.write_metadata(key=meta_key, metadata_dict=bronze_meta)
+            self.meta.mark_loaded(meta_key, bronze_meta, "loaded_to_silver")
 
             all_results.append(silver_meta)
 

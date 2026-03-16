@@ -123,8 +123,8 @@ class BronzeSchema:
         "traffic_id", "station_id", "event_time", "imsi_hash",
         "tmsi", "ip_address", "destination_ip", "destination_port",
         "protocol", "bytes_up", "bytes_down", "packets_up", "packets_down",
-        "latency_ms", "jitter_ms", "packet_loss_pct", "connection_duration_ms",
-        "created_at", "updated_at",
+        "latency_ms", "jitter_ms", "packet_loss_pct", "connection_duration_ms", 
+        "is_deleted", "created_at", "updated_at",
     })
 
     metrics_columns: frozenset[str] = frozenset({
@@ -133,14 +133,14 @@ class BronzeSchema:
         "temperature_celsius", "power_consumption_watts",
         "uplink_throughput_mbps", "downlink_throughput_mbps",
         "active_subscribers", "signal_strength_dbm",
-        "frequency_band", "channel_utilization_pct",
-        "created_at", "updated_at",
+        "frequency_band", "channel_utilization_pct", 
+        "is_deleted","created_at", "updated_at",
     })
 
     events_columns: frozenset[str] = frozenset({
         "event_id", "station_id", "event_time", "event_type", "severity",
-        "description", "metadata", "target_station_id",
-        "created_at", "updated_at",
+        "description", "metadata", "target_station_id", 
+        "is_deleted", "created_at", "updated_at",
     })
 
     def columns_for(self, table: str) -> frozenset[str]:
@@ -539,15 +539,15 @@ def check_gold_health_hourly(df: pd.DataFrame) -> list[str]:
         warnings.append("gold_health_hourly is empty")
         return warnings
 
-    if "avg_cpu" in df.columns:
-        bad = df[~df["avg_cpu"].between(0, 100)]
+    if "avg_cpu_pct" in df.columns:
+        bad = df[~df["avg_cpu_pct"].between(0, 100)]
         if len(bad):
-            warnings.append(f"{len(bad)} rows with avg_cpu outside [0,100]")
+            warnings.append(f"{len(bad)} rows with avg_cpu_pct outside [0,100]")
 
-    if "avg_latency" in df.columns:
-        bad = df[df["avg_latency"] < 0]
+    if "avg_latency_ms" in df.columns:
+        bad = df[df["avg_latency_ms"] < 0]
         if len(bad):
-            warnings.append(f"{len(bad)} rows with negative avg_latency")
+            warnings.append(f"{len(bad)} rows with negative avg_latency_ms")
 
     if "total_bytes" in df.columns:
         bad = df[df["total_bytes"] < 0]
@@ -587,7 +587,7 @@ def check_gold_anomaly_features(df: pd.DataFrame) -> list[str]:
         warnings.append("gold_anomaly_features is empty")
         return warnings
 
-    for col in ("z_score_cpu", "z_score_latency", "z_score_throughput"):
+    for col in ("z_cpu", "z_latency", "z_throughput"):
         if col in df.columns:
             extreme = df[df[col].abs() > 10]
             if len(extreme):
