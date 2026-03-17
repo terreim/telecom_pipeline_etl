@@ -6,16 +6,15 @@ from shared.common.dag_defaults import BRONZE_DEFAULTS
 from shared.common.dag_factory import BronzeDag
 
 default_args = BRONZE_DEFAULTS.copy()
-
-# Build Assets
-bronze_assets = build_assets(cfg=CFG,option="bronze")
-silver_triggers = build_assets(cfg=CFG, option="silvers_triggers")
-
+bronze_assets = build_assets(cfg=CFG, option="silvers_triggers")
 bronze = BronzeDag(tags=['bronze', 'telecom'])
 
-with bronze.create_dag(dag_id="bronze_high_volume", schedule="*/1 * * * *") as bronze_high_volume:
+with bronze.create_dag(
+    dag_id="bronze_high_volume", 
+    schedule="*/1 * * * *",
+    default_args=default_args
+) as bronze_high_volume:
     ingest_traffic = bronze.create_bronze_task(
-        outlets=[bronze_assets['bronze_traffic']],
         table=CFG.station_st,
         pk_column="traffic_id",
         time_column="event_time",
@@ -27,11 +26,20 @@ with bronze.create_dag(dag_id="bronze_high_volume", schedule="*/1 * * * *") as b
                 "created_at", "updated_at"
             ],
     )
-    ingest_traffic()
+    signal_traffic = bronze.create_signal(
+        task_id="signal_silver_traffic",
+        outlets=[bronze_assets['silver_trigger_traffic']],
+        boundary_type='hourly'
+    )
 
-with bronze.create_dag(dag_id="bronze_low_volume", schedule="*/5 * * * *") as bronze_low_volume:
+    ingest_traffic() >> signal_traffic()
+
+with bronze.create_dag(
+    dag_id="bronze_low_volume", 
+    schedule="*/5 * * * *",
+    default_args=default_args
+) as bronze_low_volume:
     ingest_events = bronze.create_bronze_task(
-        outlets=[bronze_assets['bronze_events']],
         table=CFG.station_se,
         pk_column="event_id",
         time_column="event_time",
@@ -40,8 +48,13 @@ with bronze.create_dag(dag_id="bronze_low_volume", schedule="*/5 * * * *") as br
                 "description", "metadata", "target_station_id", "is_deleted", "created_at", "updated_at"
             ],
     )
+    signal_events = bronze.create_signal(
+        task_id="signal_silver_events",
+        outlets=[bronze_assets['silver_trigger_events']],
+        boundary_type='hourly'
+    )
+
     ingest_metrics = bronze.create_bronze_task(
-        outlets=[bronze_assets['bronze_metrics']],
         table=CFG.station_pm,
         pk_column="metric_id",
         time_column="metric_time",
@@ -52,6 +65,11 @@ with bronze.create_dag(dag_id="bronze_low_volume", schedule="*/5 * * * *") as br
                 "signal_strength_dbm", "frequency_band", "channel_utilization_pct", "is_deleted", "created_at", "updated_at"
             ],
     )
+    signal_metrics = bronze.create_signal(
+        task_id="signal_silver_metrics",
+        outlets=[bronze_assets['silver_trigger_metrics']],
+        boundary_type='hourly'
+    )
 
-    ingest_events()
-    ingest_metrics()
+    ingest_events() >> signal_events()
+    ingest_metrics() >> signal_metrics()

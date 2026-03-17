@@ -30,9 +30,9 @@ def build_assets(cfg = CFG, option: str = "bronze") -> dict[str, Asset]:
 
         elif option == "gold":
             return {
-                "gold_traffic_ready": Asset("signal://gold/traffic"),
-                "gold_metrics_ready": Asset("signal://gold/metrics"),
-                "gold_events_ready": Asset("signal://gold/events"),
+                "gold_trigger_traffic": Asset("signal://gold/traffic"),
+                "gold_trigger_metrics": Asset("signal://gold/metrics"),
+                "gold_trigger_events": Asset("signal://gold/events"),
             }
         
         elif option == "gold_triggers":
