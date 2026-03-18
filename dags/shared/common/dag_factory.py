@@ -1,10 +1,14 @@
 from datetime import datetime
 from typing import Callable
+import logging
 import re
+
+from pathlib import Path
 
 from airflow.sdk import Asset, Metadata
 from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
+from airflow.task.trigger_rule import TriggerRule
 
 from shared.common.config import CFG
 from shared.util.bronze_extractor import BronzeExtractor
@@ -12,6 +16,12 @@ from shared.util.silver_transformer import SilverTransformer
 from shared.util.staging_loader import ClickHouseLoader
 from shared.util.gold_aggregator import GoldAggregator
 
+import shared.ddl as _ddl_pkg
+
+STAGING_DDL_PATH = Path(_ddl_pkg.__file__).parent / "staging_silver.sql"
+GOLD_DDL_PATH = Path(_ddl_pkg.__file__).parent / "gold_logic.sql"
+
+logger = logging.getLogger(__name__)
 
 class DagFactory:
     def __init__(
@@ -138,7 +148,37 @@ class SilverDag(DagFactory):
         return transform
 
 
-class StagingSilverDag(DagFactory):
+class SchemaManager:
+    def __init__(self, ddl_path: Path | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.ddl_path = ddl_path
+
+    def ensure_db(self) -> Callable:
+        @task(task_id="ensure_database")
+        def create_database():
+            loader = ClickHouseLoader()
+            loader.ensure_db()
+
+        return create_database
+
+    def ensure_tables(self) -> Callable:
+        @task(task_id="ensure_schema")
+        def create_schema():
+            loader = ClickHouseLoader()
+            loader.ensure_tables(ddl_path=self.ddl_path)
+
+        return create_schema
+
+    def drop_tables(self) -> Callable:
+        @task(task_id="drop_tables")
+        def drop():
+            loader = ClickHouseLoader()
+            return loader.drop_tables(ddl_path=self.ddl_path)
+
+        return drop
+
+
+class StagingSilverDag(SchemaManager, DagFactory):
     def __init__(
             self,
             start_date: datetime = datetime(2026, 1, 1),
@@ -146,8 +186,9 @@ class StagingSilverDag(DagFactory):
             max_active_runs: int = 1,
             tags: list[str] = None,
             postgres_conn_id: str = CFG.postgres_conn_id,
+            ddl_path: Path | None = STAGING_DDL_PATH,
         ):
-        super().__init__(start_date, catchup, max_active_runs, tags)
+        super().__init__(start_date=start_date, catchup=catchup, max_active_runs=max_active_runs, tags=tags, ddl_path=ddl_path)
         self.transformer = SilverTransformer(postgres_conn_id=postgres_conn_id)
 
     def create_dim_task(self, outlets: list[Asset] | None = None) -> Callable:
@@ -172,55 +213,80 @@ class StagingSilverDag(DagFactory):
             silver_subpath: str,
             outlets: list[Asset] | None = None,
             lookback_range: int = 720,
-        ) -> Callable:
-        """Load a silver subpath into a CH staging table.
+            pool: str = "staging_load",
+        ) -> tuple[Callable, Callable, Callable]:
+        """Dynamically mapped staging: one Airflow task per silver batch.
 
-        Yields Metadata with {"hours": [...]} on the outlet so gold knows
-        which partitions are ready to aggregate.
+        Returns (list_task, load_task, collect_task) — wire them as:
+            batches = list_task()
+            results = load_task.expand(batch=batches)
+            collect_task(results)
         """
+        _pattern = re.compile(r'year=(\d+)/month=(\d+)/day=(\d+)/hour=(\d+)')
 
-        @task(outlets=outlets or [], task_id=f"staging_{silver_subpath}")
-        def load_staging(**context):
+        @task(task_id=f"list_{silver_subpath}")
+        def list_batches():
             loader = ClickHouseLoader()
-            results = loader.load_staging(
-                staging_table=staging_table,
+            return loader.list_unprocessed(
                 silver_subpath=silver_subpath,
-                batch_id=f"staging_{context['run_id']}",
                 lookback_range=lookback_range,
             )
 
+        @task(task_id=f"staging_{silver_subpath}", pool=pool)
+        def load_one(batch: dict, **context):
+            loader = ClickHouseLoader()
+            return loader.load_staging_single(
+                staging_table=staging_table,
+                silver_subpath=silver_subpath,
+                batch_id=f"staging_{context['run_id']}",
+                meta_key=batch["meta_key"],
+                silver_meta_file=batch["silver_meta"],
+            )
+
+        @task(
+            task_id=f"collect_{silver_subpath}",
+            outlets=outlets or [],
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
+        def collect_signal(results: list[dict]):
             hours = set()
             for r in results:
-                partition = r.get("partition", "")
-                # year=YYYY/month=MM/day=DD/hour=HH/
-                m = re.search(
-                    r'year=(\d+)/month=(\d+)/day=(\d+)/hour=(\d+)',
-                    partition,
-                )
-                if m:
-                    hours.add(tuple(int(x) for x in m.groups()))
+                if not r:
+                    continue
+                sources = []
+                partition = r.get("partition")
+                if partition:
+                    sources.append(partition)
+                else:
+                    sources.extend(r.get("source_silver_keys", []))
+                    sources.extend(r.get("late_source_silver_keys", []))
+
+                for src in sources:
+                    m = _pattern.search(src)
+                    if m:
+                        hours.add(tuple(int(x) for x in m.groups()))
 
             if outlets and hours:
-                for outlet in outlets: # Should take one outlet at most
-                    yield Metadata(
-                        asset=outlet,
-                        extra={"hours": [list(h) for h in sorted(hours)]},
-                    )
+                yield Metadata(
+                    asset=outlets[0],
+                    extra={"hours": [list(h) for h in sorted(hours)]},
+                )
 
-            return results
+            return {"hours_signaled": len(hours)}
 
-        return load_staging
+        return list_batches, load_one, collect_signal
 
 
-class GoldDag(DagFactory):
+class GoldDag(SchemaManager, DagFactory):
     def __init__(
             self,
             start_date: datetime = datetime(2026, 1, 1),
             catchup: bool = False,
             max_active_runs: int = 1,
             tags: list[str] = None,
+            ddl_path: Path | None = GOLD_DDL_PATH,
         ):
-        super().__init__(start_date, catchup, max_active_runs, tags)
+        super().__init__(start_date=start_date, catchup=catchup, max_active_runs=max_active_runs, tags=tags, ddl_path=ddl_path)
 
     def create_hourly_task(
             self,
@@ -273,10 +339,16 @@ class GoldDag(DagFactory):
         return run_daily
 
 
-class RecoveryDag(DagFactory):
-    pass
-
-
+class RecoveryDag(SchemaManager, DagFactory):
+    def __init__(
+            self,
+            start_date: datetime = datetime(2026, 1, 1),
+            catchup: bool = False,
+            max_active_runs: int = 1,
+            tags: list[str] = None,
+            ddl_path: Path | None = None,
+        ):
+        super().__init__(start_date=start_date, catchup=catchup, max_active_runs=max_active_runs, tags=tags, ddl_path=ddl_path)
 # =============================================================================
 # Gold Catchup DAG
 # Catches full_ silver files that were never loaded to CH staging

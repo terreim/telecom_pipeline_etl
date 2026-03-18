@@ -273,7 +273,7 @@ def _normalize_event_time(
     s = pd.to_datetime(series, errors="coerce")
     if s.dt.tz is not None:
         s = s.dt.tz_localize(None)
-    s = s.dt.tz_localize(tz_source).dt.tz_convert("UTC")
+    s = s.dt.tz_localize(tz_source).dt.tz_localize(None)
     return s
 
 
@@ -314,7 +314,7 @@ def validate_traffic(
 
     # ── 1. Timezone normalisation ──────────────────────────────────────
     df["event_time"] = _normalize_event_time(df["event_time"], profile.timezone_source)
-    now = pd.Timestamp.now(tz="UTC")
+    now = pd.Timestamp.now(tz="UTC").tz_convert(profile.timezone_source).tz_localize(None)
     future_cutoff = now + pd.Timedelta(seconds=profile.max_future_tolerance_seconds)
 
     # ── 2-5. Quality conditions ────────────────────────────────────────
@@ -505,7 +505,7 @@ def validate_events(
 
     # ── Future-timestamp guard ─────────────────────────────────────────
     if "event_time" in df.columns:
-        now = pd.Timestamp.now(tz="UTC")
+        now = pd.Timestamp.now(tz="UTC").tz_convert(profile.timezone_source).tz_localize(None)
         future_cutoff = now + pd.Timedelta(seconds=profile.max_future_tolerance_seconds)
         conditions["event_future"] = df["event_time"] > future_cutoff
 

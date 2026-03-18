@@ -94,21 +94,21 @@ def sql_ch_dim_station() -> str:
         CREATE TABLE IF NOT EXISTS {CFG.schema_name}.{CFG.dim_station} (
             station_id UInt32,
             station_code String,
-            operator_code String,
-            operator_name String,
-            province String,
-            district String,
-            region String,
-            density_class String,
-            technology String,
+            operator_code LowCardinality(String),
+            operator_name LowCardinality(String),
+            province LowCardinality(String),
+            district LowCardinality(String),
+            region LowCardinality(String),
+            density_class LowCardinality(String),
+            technology LowCardinality(String),
             updated_at DateTime
         ) ENGINE = ReplacingMergeTree(updated_at)
-        PRIMARY KEY station_id
+        ORDER BY station_id
     """
 
 def sql_ch_dim_dict() -> str:
     return f"""
-        CREATE DICTIONARY IF NOT EXISTS {CFG.schema}.{CFG.dim_dict}
+        CREATE DICTIONARY IF NOT EXISTS {CFG.schema_name}.{CFG.dim_dict}
         (
             `station_id` UInt32,
             `station_code` String,
@@ -121,7 +121,7 @@ def sql_ch_dim_dict() -> str:
             `technology` String
         )
         PRIMARY KEY station_id
-        SOURCE(CLICKHOUSE(TABLE '{CFG.dim_station}' DB '{CFG.schema}'))
+        SOURCE(CLICKHOUSE(TABLE '{CFG.dim_station}' DB '{CFG.schema_name}'))
         LIFETIME(MIN 300 MAX 600)
         LAYOUT(FLAT());
     """
@@ -188,10 +188,10 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
             m.avg_cpu AS avg_cpu_pct,
             m.max_cpu AS max_cpu_pct,
             m.avg_memory AS avg_memory_pct,
-            m.avg_temp AS avg_temperature_c,
-            m.max_temp AS max_temperature_c,
-            m.avg_throughput AS avg_throughput_mbps,
-            m.error_count AS error_count,
+            m.avg_temp AS avg_temperature_celsius,
+            m.max_temp AS max_temperature_celsius,
+            m.avg_uplink_throughput AS avg_uplink_throughput_mbps,
+            m.avg_downlink_throughput AS avg_downlink_throughput_mbps,
                         
             e.alarm_count,
             e.warning_count,
@@ -204,13 +204,13 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
             LEFT JOIN (
                 SELECT
                     station_id,
-                    avg(cpu_util_pct) AS avg_cpu,
-                    max(cpu_util_pct) AS max_cpu,
-                    avg(memory_util_pct) AS avg_memory,
-                    avg(temperature_c) AS avg_temp,
-                    max(temperature_c) AS max_temp,
-                    avg(throughput_mbps) AS avg_throughput,
-                    max(error_count) AS error_count
+                    avg(cpu_usage_pct) AS avg_cpu,
+                    max(cpu_usage_pct) AS max_cpu,
+                    avg(memory_usage_pct) AS avg_memory,
+                    avg(temperature_celsius) AS avg_temp,
+                    max(temperature_celsius) AS max_temp,
+                    avg(uplink_throughput_mbps) AS avg_uplink_throughput,
+                    avg(downlink_throughput_mbps) AS avg_downlink_throughput
                 FROM {CFG.schema_name}.{CFG.station_staging_pm}
                 WHERE metric_time >= '{hour_start}' AND metric_time <= '{hour_end}'
                     AND is_deleted = false
@@ -242,7 +242,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
                 station_id, hour_start, station_code, operator_code,
                 province, region, density_class, technology,
                 m.avg_cpu, m.max_cpu, m.avg_memory, m.avg_temp,
-                m.max_temp, m.avg_throughput, m.error_count,
+                m.max_temp, m.avg_uplink_throughput, m.avg_downlink_throughput,
                 e.alarm_count, e.warning_count, e.critical_count,
                 e.handover_count, e.incident_active, e.incident_type,
                 e.maintenance_active
@@ -353,7 +353,7 @@ def sql_gold_anomaly_features(year: int, month: int, day: int, hour: int) -> str
                 sh.avg_latency_ms AS current_latency_ms,
                 sh.avg_packet_loss_pct AS current_packet_loss,
                 sh.avg_cpu_pct AS current_cpu_pct,
-                sh.avg_throughput_mbps AS current_throughput,
+                sh.avg_downlink_throughput_mbps AS current_throughput,
                 sh.unique_subscribers AS current_subscribers
             FROM {CFG.schema_name}.{CFG.station_health} sh
             WHERE toDate(sh.hour_start) = '{report_date}'
@@ -366,8 +366,8 @@ def sql_gold_anomaly_features(year: int, month: int, day: int, hour: int) -> str
                 stddevPop(avg_latency_ms) AS baseline_latency_std,
                 avg(avg_cpu_pct) AS baseline_cpu_mean,
                 stddevPop(avg_cpu_pct) AS baseline_cpu_std,
-                avg(avg_throughput_mbps) AS baseline_throughput_mean,
-                stddevPop(avg_throughput_mbps) AS baseline_throughput_std,
+                avg(avg_downlink_throughput_mbps) AS baseline_throughput_mean,
+                stddevPop(avg_downlink_throughput_mbps) AS baseline_throughput_std,
                 avg(unique_subscribers) AS baseline_subs_mean,
                 stddevPop(unique_subscribers) AS baseline_subs_std
             FROM {CFG.schema_name}.{CFG.station_health}
@@ -611,10 +611,10 @@ def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
 
         SELECT
             mp.station_id,
-            dictGet('telecom.dict_station', 'station_code', mp.station_id) AS station_code,
-            dictGet('telecom.dict_station', 'operator_code', mp.station_id) AS operator_code,
-            dictGet('telecom.dict_station', 'region', mp.station_id) AS region,
-            dictGet('telecom.dict_station', 'technology', mp.station_id) AS technology,
+            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'station_code', mp.station_id) AS station_code,
+            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'operator_code', mp.station_id) AS operator_code,
+            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'region', mp.station_id) AS region,
+            dictGet('{CFG.schema_name}.{CFG.dim_dict}', 'technology', mp.station_id) AS technology,
             mp.maintenance_start,
             mp.maintenance_end,
             JSONExtractInt(mp.start_meta::String, 'planned_duration_min') AS planned_duration_min,

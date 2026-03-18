@@ -77,7 +77,7 @@ class GoldAggregator:
             partition = f"year={year:04d}/month={month:02d}/day={day:02d}"
             sql_args = (year, month, day)
 
-        batch_id = batch_id or f"{report.name}__{partition}"
+        batch_id = batch_id or f"{report.name}__{partition.replace('/', '-').replace("=", "")}"
         meta = gold_metadata_template()
         meta |= {
             "report": report.name,
@@ -149,8 +149,38 @@ class GoldAggregator:
         self.ch_io.insert_with_fallback(df=df, s3_url=s3_url, ch_table=ch_table)
 
     def _write_metadata(self, report_name: str, partition: str, batch_id: str, meta: dict):
-        key = f"metadata/{self.layer}/{report_name}/{partition}/{batch_id}.json"
+        key = f"metadata/watermark/{self.layer}/{report_name}/{partition}/{batch_id}.json"
         self.meta.write_metadata(key=key, metadata_dict=meta)
+
+    # =========================================================================
+    # Recovery helpers
+    # =========================================================================
+
+    def _partition_hour(self, year: int, month: int, day: int, hour: int) -> str:
+        return f"year={year:04d}/month={month:02d}/day={day:02d}/hour={hour:02d}"
+
+    def _partition_day(self, year: int, month: int, day: int) -> str:
+        return f"year={year:04d}/month={month:02d}/day={day:02d}"
+
+    def is_processed(self, report_name: str, partition: str) -> bool:
+        """True if the latest metadata for this report+partition has status='complete'."""
+        keys = self.meta.s3_hook.list_keys(
+            bucket_name=self.bucket,
+            prefix=f"metadata/{self.layer}/{report_name}/{partition}/",
+        ) or []
+        json_keys = [k for k in keys if k.endswith(".json")]
+        if not json_keys:
+            return False
+        latest = self.meta.read_metadata(sorted(json_keys)[-1])
+        return bool(latest and latest.get("status") == "complete")
+
+    def delete_hour(self, year: int, month: int, day: int, hour: int) -> None:
+        """Delete all hourly gold CH data for this (y, m, d, h)."""
+        self.ch_io.delete_gold_hour(year, month, day, hour)
+
+    def delete_day(self, year: int, month: int, day: int) -> None:
+        """Delete all daily gold CH data for this (y, m, d)."""
+        self.ch_io.delete_gold_day(year, month, day)
 
     # =========================================================================
     # Health scoring
@@ -164,14 +194,14 @@ class GoldAggregator:
             latency_score = max(0, 100 - (row['avg_latency_ms'] - 30) * (100 / 470))
             loss_score = max(0, 100 - row['avg_packet_loss_pct'] * (100 / 10))
             cpu_score = max(0, 100 - max(0, row['avg_cpu_pct'] - 50) * 2)
-            temp_score = max(0, 100 - max(0, row['avg_temperature_c'] - 45) * (100 / 35))
+            temp_score = max(0, 100 - max(0, row['avg_temperature_celsius'] - 45) * (100 / 35))
 
             alarm_penalty = row.get('warning_count', 0) * 10 + row.get('critical_count', 0) * 30
             error_score = max(0, 100 - alarm_penalty)
 
             tech_expected = {'2G': 0.01, '3G': 0.1, '4G': 1.0, '5G': 5.0}
             expected = tech_expected.get(row['technology'], 1.0) * 1000
-            throughput_score = min(1.0, row['avg_throughput_mbps'] / max(0.001, expected * 0.3)) * 100
+            throughput_score = min(1.0, row['avg_downlink_throughput_mbps'] / max(0.001, expected * 0.3)) * 100
 
             score = (
                 latency_score * 0.25 +
@@ -213,6 +243,10 @@ class GoldAggregator:
         for baseline_col, current_col in BASELINE_TO_CURRENT.items():
             df[baseline_col] = df[baseline_col].fillna(df[current_col])
 
+        std_cols = ['baseline_latency_std', 'baseline_cpu_std', 'baseline_throughput_std', 'baseline_subs_std']
+        for col in std_cols:
+            df[col] = df[col].fillna(0.0)
+
         def _features(row):
             z_lat  = (row['current_latency_ms']  - row['baseline_latency_mean'])    / max(row['baseline_latency_std'],    1e-6)
             z_cpu  = (row['current_cpu_pct']      - row['baseline_cpu_mean'])        / max(row['baseline_cpu_std'],        1e-6)
@@ -250,8 +284,8 @@ class GoldAggregator:
                     'station_id', 'station_code', 'hour_start', 'operator_code', 'province', 'region',
                     'density_class', 'technology', 'session_count', 'unique_subscribers', 'total_bytes',
                     'avg_latency_ms', 'p95_latency_ms', 'avg_packet_loss_pct', 'high_latency_ratio',
-                    'avg_cpu_pct', 'max_cpu_pct', 'avg_memory_pct', 'avg_temperature_c', 'max_temperature_c',
-                    'avg_throughput_mbps', 'error_count', 'alarm_count', 'warning_count', 'critical_count',
+                    'avg_cpu_pct', 'max_cpu_pct', 'avg_memory_pct', 'avg_temperature_celsius', 'max_temperature_celsius',
+                    'avg_uplink_throughput_mbps', 'avg_downlink_throughput_mbps', 'alarm_count', 'warning_count', 'critical_count',
                     'handover_count', 'incident_active', 'incident_type', 'maintenance_active',
                 ],
                 s3_prefix="health",

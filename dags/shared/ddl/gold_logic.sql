@@ -3,78 +3,79 @@
 -- Health Scoring Table
 CREATE TABLE IF NOT EXISTS telecom.gold_health_hourly
 (
-    station_id           UInt32,
-    station_code         LowCardinality(String),
-    hour_start           DateTime64(3, 'Asia/Ho_Chi_Minh'),
-    hour_date            Date MATERIALIZED toDate(hour_start),
-    operator_code        LowCardinality(String),
-    province             LowCardinality(String),
-    region               LowCardinality(String),
-    density              LowCardinality(String),
-    technology           LowCardinality(String),
-    session_count        UInt32,
-    unique_subscribers   UInt32,
-    total_bytes          UInt64,
-    avg_latency_ms       Float64,
-    p95_latency_ms       Float64,
-    avg_packet_loss_pct  Float64,
-    high_latency_ratio   Float64,
-    avg_cpu_pct          Float64,
-    max_cpu_pct          Float64,
-    avg_memory_pct       Float64,
-    avg_temperature_c    Float64,
-    max_temperature_c    Float64,
-    avg_throughput_mbps  Float64,
-    error_count          UInt32,
-    alarm_count          UInt16,
-    warning_count        UInt16,
-    critical_count       UInt16,
-    handover_count       UInt16,
-    incident_active      UInt8,
-    incident_type        LowCardinality(Nullable(String)),
-    maintenance_active   UInt8,
-    health_score         Nullable(Float64),
-    health_category      LowCardinality(Nullable(String)),
-    loaded_at            DateTime DEFAULT now()
-)
-ENGINE = MergeTree()
-PARTITION BY toYYYYMM(hour_start)
-ORDER BY (station_id, hour_start)
-TTL hour_start + INTERVAL 180 DAY;
+    station_id                    UInt32,
+    station_code                  LowCardinality(String),
+    hour_start                    DateTime64(3, 'Asia/Ho_Chi_Minh'),
+    hour_date                     Date MATERIALIZED toDate(hour_start),
+    operator_code                 LowCardinality(String),
+    province                      LowCardinality(String),
+    region                        LowCardinality(String),
+    density_class                 LowCardinality(String),
+    technology                    LowCardinality(String),
+    session_count                 UInt64,
+    unique_subscribers            UInt64,
+    total_bytes                   UInt64,
+    avg_latency_ms                Float64,
+    p95_latency_ms                Float64,
+    avg_packet_loss_pct           Float64,
+    high_latency_ratio            Float64,
+    avg_cpu_pct                   Nullable(Float64),
+    max_cpu_pct                   Nullable(Float64),
+    avg_memory_pct                Nullable(Float64),
+    avg_temperature_celsius       Nullable(Float64),
+    max_temperature_celsius       Nullable(Float64),
+    avg_uplink_throughput_mbps    Nullable(Float64),
+    avg_downlink_throughput_mbps  Nullable(Float64),
+    alarm_count                   Nullable(UInt64),
+    warning_count                 Nullable(UInt64),
+    critical_count                Nullable(UInt64),
+    handover_count                Nullable(UInt64),
+    incident_active               Nullable(UInt8),
+    incident_type                 LowCardinality(Nullable(String)),
+    maintenance_active            Nullable(UInt8),
 
-CREATE TABLE IF NOT EXISTS telecom.health_daily
-(
-    report_date      Date,
-    station_code     LowCardinality(String),
-    operator_code    LowCardinality(String),
-    region           LowCardinality(String),
-    density          LowCardinality(String),
-    avg_health       AggregateFunction(avg, Float64),
-    min_health       AggregateFunction(min, Float64),
-    max_health       AggregateFunction(max, Float64),
-    hours_critical   AggregateFunction(countIf, UInt8),
-    hours_degraded   AggregateFunction(countIf, UInt8)
-)
-ENGINE = AggregatingMergeTree()
-PARTITION BY toYYYYMM(report_date)
-ORDER BY (report_date, station_code);
+    health_score                  Nullable(Float64) DEFAULT 0,
+    health_category               LowCardinality(Nullable(String)),
+    loaded_at                     DateTime DEFAULT now()
+    )
+    ENGINE = MergeTree()
+    PARTITION BY toYYYYMM(hour_start)
+    ORDER BY (station_id, hour_start)
+    TTL hour_start + INTERVAL 180 DAY;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS telecom.mv_health_daily
-TO telecom.health_daily
-AS SELECT
-    hour_date                                                                  AS report_date,
-    station_code,
-    operator_code,
-    region,
-    density,
-    avgState(health_score)                                                     AS avg_health,
-    minState(health_score)                                                     AS min_health,
-    maxState(health_score)                                                     AS max_health,
-    countIfState(health_category = 'critical')                                 AS hours_critical,
-    countIfState(health_category = 'degraded' OR health_category = 'critical') AS hours_degraded
-FROM telecom.gold_health_hourly
-WHERE health_score IS NOT NULL
-GROUP BY hour_date, station_code, operator_code, region, density;
+    CREATE TABLE IF NOT EXISTS telecom.health_daily
+    (
+        report_date      Date,
+        station_code     LowCardinality(String),
+        operator_code    LowCardinality(String),
+        region           LowCardinality(String),
+        density_class    LowCardinality(String),
+        avg_health       AggregateFunction(avg, Nullable(Float64)),
+        min_health       AggregateFunction(min, Nullable(Float64)),
+        max_health       AggregateFunction(max, Nullable(Float64)),
+        hours_critical   AggregateFunction(countIf, Nullable(UInt8)),
+        hours_degraded   AggregateFunction(countIf, Nullable(UInt8))
+    )
+    ENGINE = AggregatingMergeTree()
+    PARTITION BY toYYYYMM(report_date)
+    ORDER BY (report_date, station_code);
+
+    CREATE MATERIALIZED VIEW IF NOT EXISTS telecom.mv_health_daily
+    TO telecom.health_daily
+    AS SELECT
+        hour_date                                                                  AS report_date,
+        station_code,
+        operator_code,
+        region,
+        density_class,
+        avgState(health_score)                                                     AS avg_health,
+        minState(health_score)                                                     AS min_health,
+        maxState(health_score)                                                     AS max_health,
+        countIfState(health_category = 'critical')                                 AS hours_critical,
+        countIfState(health_category = 'degraded' OR health_category = 'critical') AS hours_degraded
+    FROM telecom.gold_health_hourly
+    WHERE health_score IS NOT NULL
+    GROUP BY hour_date, station_code, operator_code, region, density_class;
 
 -- SALA Compliance Table
 CREATE TABLE IF NOT EXISTS telecom.gold_sla_compliance
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS telecom.gold_sla_compliance
     operator_code        LowCardinality(String),
     province             LowCardinality(String),
     region               LowCardinality(String),
-    density              LowCardinality(String),
+    density_class              LowCardinality(String),
     technology           LowCardinality(String),
     total_hours          UInt8,
     active_hours         UInt8,

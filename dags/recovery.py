@@ -1,126 +1,65 @@
 """
-Recovery DAGs — manually triggered to clear markers and re-run pipeline stages.
+Recovery DAGs — manually triggered to reset metadata flags and re-run pipeline stages.
 
-clickhouse_recovery:
-    Clear .ch_loaded markers → re-insert silver data into ClickHouse.
-    Use when CH data is lost/corrupted but silver parquets in MinIO are fine.
+All DAGs are schedule=None (manual only). Each follows:
 
-silver_recovery:
-    Clear _SUCCESS + .ch_loaded markers → re-transform from bronze.
-    Use when a buggy ETL produced incorrect silver data and needs a full redo.
+    list_affected (task)
+        → ApprovalOperator  (HITL — shows summary, pauses for human approval)
+        → execute_recovery  (task — runs only if approved)
 
-Both DAGs are manual-only (no schedule). Trigger via Airflow UI with optional
-config to target specific subpaths or adjust lookback window:
+silver_recovery
+    Reset loaded_to_silver=False on bronze metadata → silver DAG re-processes on next run.
+    Optional mode="delete" also removes the silver parquet files from S3.
 
-    { "lookback_hours": 168, "subpaths": ["traffic_cleaned"] }
+staging_recovery
+    Reset loaded_to_warehouse=False on silver metadata → staging DAG re-loads on next run.
+
+gold_recovery
+    Delete CH gold rows → re-run GoldAggregator for the affected hours/days.
+    Uses is_processed() to skip already-complete periods (idempotent on retry).
+
+Params
+------
+All DAGs accept:
+    lookback_hours (int)   — how many hours back to scan (default 168 = 7 days)
+
+silver_recovery also accepts:
+    table  (str)           — bronze table name, e.g. "subscriber_traffic"
+    mode   (str)           — "unmark" (default) or "delete" (also removes silver parquets)
+
+staging_recovery also accepts:
+    silver_subpath (str)   — e.g. "traffic_cleaned"
+
+gold_recovery also accepts:
+    skip_daily (bool)      — if True, skip daily report recomputation
 """
+
+from datetime import datetime
+from pathlib import Path
 
 from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
-from datetime import datetime, timedelta
+from airflow.providers.standard.operators.hitl import ApprovalOperator
 
 from shared.common.config import CFG
-from telecom_pipeline_etl.dags.shared.util.staging_loader import ClickHouseLoader
-from shared.util.gold_aggregator import GoldAggregator
+from shared.common.dag_defaults import RECOVERY_DEFAULTS
+from shared.common.dag_factory import RecoveryDag
+from shared.util.recovery_manager import SilverRecovery, StagingRecovery, GoldRecovery
+
+import shared.ddl as _ddl_pkg
 
 import logging
 log = logging.getLogger(__name__)
 
-default_args = {
-    "owner": "data-team",
-    "retries": 50,
-    "retry_delay": timedelta(seconds=60),
-    "execution_timeout": timedelta(minutes=60),
-}
 
-ALL_SILVER_SUBPATHS = {
-    CFG.station_cleaned_st: CFG.station_staging_st,
-    CFG.station_cleaned_pm: CFG.station_staging_pm,
-    CFG.station_cleaned_se: CFG.station_staging_se,
-}
+GOLD_DDL_PATH = Path(_ddl_pkg.__file__).parent / "gold_logic.sql"
+recovery = RecoveryDag(tags=['recovery', 'gold'], ddl_path=GOLD_DDL_PATH)
 
 # =============================================================================
-# ClickHouse Recovery — clear .ch_loaded markers, then re-load to CH
+# Silver Recovery
 # =============================================================================
 
-with DAG(
-    dag_id="clickhouse_recovery",
-    schedule=None,
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    max_active_runs=1,
-    tags=["recovery", "clickhouse"],
-    default_args=default_args,
-    params={
-        "lookback_hours": 168,
-        "subpaths": [],
-    },
-) as dag:
-
-    @task
-    def clear_ch_loaded_markers(**context):
-        """Delete .ch_loaded markers so staging tasks will re-insert."""
-        loader = ClickHouseLoader()
-        params = context["params"]
-        lookback = int(params.get("lookback_hours", 168))
-        target_subpaths = params.get("subpaths") or list(ALL_SILVER_SUBPATHS.keys())
-
-        results = {}
-        for subpath in target_subpaths:
-            results[subpath] = loader.clear_ch_loaded_markers(
-                silver_subpath=subpath,
-                lookback_hours=lookback,
-            )
-        return results
-
-    @task
-    def reload_to_clickhouse(clear_results, **context):
-        """Re-insert all unloaded silver files into ClickHouse staging.
-        
-        Uses partition-level glob INSERTs to minimize MergeTree part creation.
-        """
-        loader = ClickHouseLoader()
-        params = context["params"]
-        lookback = int(params.get("lookback_hours", 168))
-        target_subpaths = params.get("subpaths") or list(ALL_SILVER_SUBPATHS.keys())
-
-        total_loaded = 0
-        results = {}
-
-        for subpath in target_subpaths:
-            staging_table = ALL_SILVER_SUBPATHS[subpath]
-            unloaded = loader.find_unloaded_silver_keys(
-                silver_subpath=subpath,
-                lookback_hours=lookback,
-            )
-
-            if unloaded:
-                batch_result = loader.insert_silver_partition_batch(
-                    silver_subpath=subpath,
-                    staging_table=staging_table,
-                    s3_keys=unloaded,
-                )
-                total_loaded += batch_result["files"]
-                results[subpath] = {
-                    "found": len(unloaded),
-                    "loaded": batch_result["files"],
-                    "partitions": batch_result["partitions"],
-                }
-            else:
-                results[subpath] = {"found": 0, "loaded": 0}
-
-        if total_loaded == 0:
-            raise AirflowSkipException("No unloaded silver files found after clearing markers")
-
-        return results
-
-    cleared = clear_ch_loaded_markers()
-    reload_to_clickhouse(cleared)
-
-
-# =============================================================================
-# Silver Recovery — clear _SUCCESS (+ .ch_loaded) markers, then re-transform
-# =============================================================================
+users = None
 
 with DAG(
     dag_id="silver_recovery",
@@ -129,49 +68,106 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["recovery", "silver"],
-    default_args=default_args,
+    default_args=RECOVERY_DEFAULTS,
     params={
         "lookback_hours": 168,
-        "subpaths": [],
+        "table": CFG.station_st,
+        "mode": "unmark",           # "unmark" | "delete"
     },
 ) as dag:
 
-    @task
-    def clear_success_markers(**context):
-        """Delete _SUCCESS + .ch_loaded markers so silver re-transforms from bronze."""
-        loader = ClickHouseLoader()
-        params = context["params"]
-        lookback = int(params.get("lookback_hours", 168))
-        target_subpaths = params.get("subpaths") or list(ALL_SILVER_SUBPATHS.keys())
+    @task(task_id="list_affected")
+    def list_affected_silver(**context):
+        p = context["params"]
+        table = p.get("table", CFG.station_st)
+        lookback = int(p.get("lookback_hours", 168))
+        summary = SilverRecovery().list_affected(table=table, lookback=lookback)
+        log.info(f"Silver recovery scope: {summary}")
+        if summary["count"] == 0:
+            raise AirflowSkipException(f"No loaded_to_silver entries found for {table}")
+        return summary
 
-        results = {}
-        for subpath in target_subpaths:
-            results[subpath] = loader.clear_success_markers(
-                silver_subpath=subpath,
-                lookback_hours=lookback,
-            )
-        return results
+    approve = ApprovalOperator(
+        subject="Silver recovery — approve to reset loaded_to_silver flags (and optionally delete silver parquets).",
+        task_id="approve",
+        assigned_users=users,
+    )
 
-    clear_success_markers()
+    @task(task_id="execute_recovery")
+    def execute_silver_recovery(**context):
+        p = context["params"]
+        table = p.get("table", CFG.station_st)
+        lookback = int(p.get("lookback_hours", 168))
+        mode = p.get("mode", "unmark")
+
+        mgr = SilverRecovery()
+        result = mgr.unmark_all(table=table, lookback=lookback)
+
+        if mode == "delete":
+            delete_result = mgr.delete_all(table=table, lookback=lookback)
+            result["deleted"] = delete_result["deleted"]
+            result["delete_errors"] = delete_result["errors"]
+
+        log.info(f"Silver recovery complete: {result}")
+        return result
+
+    summary = list_affected_silver()
+    execute = execute_silver_recovery()
+    summary >> approve >> execute
 
 
 # =============================================================================
-# Gold Recovery — clear gold CH tables, then re-aggregate from staging data
-#
-# Bypasses the normal signal chain (health_hourly → anomaly → SLA → …) and
-# calls every GoldAggregator method directly, one hour / day at a time.
-#
-# Why not signals?
-#   Airflow asset signals are fire-and-forget.  A task that yields Metadata
-#   cannot wait for the downstream DAG to finish processing.  So there is no
-#   way to "emit signal → wait for downstream → next iteration".  Instead we
-#   inline everything and iterate sequentially.  Each hour's DataFrame is
-#   ~1 000 rows — no OOM risk.
-#
-# Retry safety:
-#   Each hour / day writes an S3 marker (_DONE) after successful processing.
-#   On retry, already-done items are skipped.  Before processing an item,
-#   its CH data is deleted per-item so partial inserts don't cause duplicates.
+# Staging Recovery
+# =============================================================================
+
+with DAG(
+    dag_id="staging_recovery",
+    schedule=None,
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    max_active_runs=1,
+    tags=["recovery", "staging"],
+    default_args=RECOVERY_DEFAULTS,
+    params={
+        "lookback_hours": 168,
+        "silver_subpath": CFG.station_cleaned_st,
+    },
+) as dag:
+
+    @task(task_id="list_affected")
+    def list_affected_staging(**context):
+        p = context["params"]
+        subpath = p.get("silver_subpath", CFG.station_cleaned_st)
+        lookback = int(p.get("lookback_hours", 168))
+        summary = StagingRecovery().list_affected(silver_subpath=subpath, lookback=lookback)
+        log.info(f"Staging recovery scope: {summary}")
+        if summary["count"] == 0:
+            raise AirflowSkipException(f"No loaded_to_warehouse entries found for {subpath}")
+        return summary
+
+    approve = ApprovalOperator(
+        subject="Staging recovery — approve to reset loaded_to_warehouse flags. Staging DAG will re-load on its next run.",
+        task_id="approve",
+        assigned_users=users,
+    )
+
+    @task(task_id="execute_recovery")
+    def execute_staging_recovery(**context):
+        p = context["params"]
+        subpath = p.get("silver_subpath", CFG.station_cleaned_st)
+        lookback = int(p.get("lookback_hours", 168))
+
+        result = StagingRecovery().unmark_all(silver_subpath=subpath, lookback=lookback)
+        log.info(f"Staging recovery complete: {result}")
+        return result
+
+    summary = list_affected_staging()
+    execute = execute_staging_recovery()
+    summary >> approve >> execute
+
+
+# =============================================================================
+# Gold Recovery
 # =============================================================================
 
 with DAG(
@@ -181,118 +177,64 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["recovery", "gold"],
-    default_args=default_args,
+    default_args=RECOVERY_DEFAULTS,
     params={
         "lookback_hours": 168,
         "skip_daily": False,
     },
 ) as dag:
 
-    @task
+    @task(task_id="discover_periods")
     def discover_periods(**context):
-        """Build sorted lists of hours and days that need reprocessing."""
-        import pandas as pd
-
-        lookback = int(context["params"].get("lookback_hours", 168))
-        now = pd.Timestamp.now("UTC").floor("h")
-
-        hours = []
-        days_set = set()
-        for i in range(lookback):
-            ts = now - pd.Timedelta(hours=i)
-            hours.append((ts.year, ts.month, ts.day, ts.hour))
-            days_set.add((ts.year, ts.month, ts.day))
-
-        return {
-            "hours": sorted(hours),
-            "days": sorted(days_set),
+        p = context["params"]
+        lookback = int(p.get("lookback_hours", 168))
+        periods = GoldRecovery.build_periods(lookback)
+        summary = {
+            "hours": len(periods["hours"]),
+            "days": len(periods["days"]),
+            "range": periods["range"],
+            # Pass the actual lists for downstream tasks
+            "_hours": periods["hours"],
+            "_days": periods["days"],
         }
+        log.info(f"Gold recovery scope: {summary['hours']} hours, {summary['days']} days — {summary['range']}")
+        return summary
 
-    @task
-    def clear_gold_markers(periods, **context):
-        """Delete all gold _DONE markers for the target range.
+    approve = ApprovalOperator(
+        task_id="approve",
+        subject="Gold recovery — approve to DELETE CH gold data and recompute from staging. This is destructive.",
+        assigned_users=users,
+    )
 
-        Runs before recompute tasks so every hour/day will be re-processed.
-        """
-        aggregator = GoldAggregator()
-        hours = [tuple(h) for h in periods["hours"]]
-        days = [tuple(d) for d in periods["days"]]
+    @task(task_id="delete_gold")
+    def delete_gold(periods):
+        hours = [tuple(h) for h in periods["_hours"]]
+        days  = [tuple(d) for d in periods["_days"]]
+        result = GoldRecovery().delete_all(hours=hours, days=days)
+        log.info(f"Gold delete complete: {result}")
+        return result
 
-        skip_daily = context["params"].get("skip_daily", False)
-
-        h_cleared = aggregator.clear_hourly_markers(hours)
-        d_cleared = 0 if skip_daily else aggregator.clear_daily_markers(days)
-
-        return {"hourly_cleared": h_cleared, "daily_cleared": d_cleared}
-
-    @task
-    def recompute_hourly(periods, markers_cleared, **context):
-        """Re-compute gold_health_hourly and gold_anomaly_features.
-
-        Processes one hour at a time.  Skips hours that already have a
-        ``_DONE`` marker (from a previous partial run).  For each new hour:
-        delete CH data → recompute → write marker.
-        """
-        aggregator = GoldAggregator()
-        hours = [tuple(h) for h in periods["hours"]]
-
-        processed = 0
-        skipped = 0
-        for year, month, day, hour in hours:
-            if aggregator.is_hour_processed(year, month, day, hour):
-                skipped += 1
-                continue
-
-            aggregator.delete_gold_hour(year, month, day, hour)
-            aggregator.gold_health_hourly(year, month, day, hour)
-            aggregator.gold_anomaly_features(year, month, day, hour)
-            aggregator.mark_hour_done(year, month, day, hour)
-
-            processed += 1
-            if processed % 12 == 0:
-                log.info(
-                    "Gold hourly recovery: %d processed, %d skipped / %d total",
-                    processed, skipped, len(hours),
-                )
-
-        return {"processed": processed, "skipped": skipped}
-
-    @task
-    def recompute_daily(periods, hourly_done, **context):
-        """Re-compute all daily gold tables.
-
-        Must run after hourly (SLA, outage, etc. read from gold_health_hourly).
-        Skips days that already have a ``_DONE`` marker.  For each new day:
-        delete CH data → recompute all 6 daily tables → write marker.
-        """
-        skip_daily = context["params"].get("skip_daily", False)
-        if skip_daily:
-            raise AirflowSkipException("skip_daily=True, skipping daily recompute")
-
-        aggregator = GoldAggregator()
-        days = [tuple(d) for d in periods["days"]]
-
-        processed = 0
-        skipped = 0
-        for year, month, day in days:
-            if aggregator.is_day_processed(year, month, day):
-                skipped += 1
-                continue
-
-            aggregator.delete_gold_day(year, month, day)
-            aggregator.gold_sla_compliance(year, month, day)
-            aggregator.gold_outage_report(year, month, day)
-            aggregator.gold_maintenance_report(year, month, day)
-            aggregator.gold_handover_report(year, month, day)
-            aggregator.gold_alarm_report(year, month, day)
-            aggregator.gold_region_daily(year, month, day)
-            aggregator.mark_day_done(year, month, day)
-
-            processed += 1
-
-        return {"processed": processed, "skipped": skipped}
+    @task(task_id="recompute_gold")
+    def recompute_gold(periods, **context):
+        skip_daily = bool(context["params"].get("skip_daily", False))
+        hours = [tuple(h) for h in periods["_hours"]]
+        days  = [tuple(d) for d in periods["_days"]]
+        result = GoldRecovery().recompute_all(hours=hours, days=days, skip_daily=skip_daily)
+        log.info(f"Gold recompute complete: {result}")
+        return result
 
     periods = discover_periods()
-    markers_cleared = clear_gold_markers(periods)
-    hourly_done = recompute_hourly(periods, markers_cleared)
-    recompute_daily(periods, hourly_done)
+    deleted = delete_gold(periods)
+    recomputed = recompute_gold(periods)
+    periods >> approve >> deleted >> recomputed
+
+
+with recovery.create_dag(
+    dag_id="clickhouse_recovery",
+    schedule=None,
+    default_args=RECOVERY_DEFAULTS,
+) as clickhouse_recovery:
+    drop_tables = recovery.drop_tables()()
+    ensure_db = recovery.ensure_db()()
+    ensure_tables = recovery.ensure_tables()()
+    drop_tables >> ensure_db >> ensure_tables

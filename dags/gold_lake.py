@@ -43,7 +43,6 @@ with DAG(
     schedule=[asset for _, asset in staging_assets.items()],
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    max_active_runs=1,
     tags=['gold', 'health', 'hourly'],
     default_args=default_args,
     params={
@@ -83,8 +82,11 @@ with DAG(
             yield Metadata(asset=gold_assets["health_daily_ready"], extra={"days": [list(d) for d in sorted(daily_days)]})
 
         return results
+    
+    ensure_db = gold.ensure_db()()
+    ensure_tables = gold.ensure_tables()()
 
-    compute_health_hourly()
+    ensure_db >> ensure_tables >> compute_health_hourly()
 
 
 with DAG(
@@ -92,7 +94,6 @@ with DAG(
     schedule=[gold_assets["health_hourly_ready"]],
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    max_active_runs=1,
     tags=['gold', 'anomaly', 'hourly'],
     default_args=default_args,
 ) as dag:
@@ -104,7 +105,6 @@ with DAG(
     schedule=[gold_assets["health_daily_ready"]],
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    max_active_runs=1,
     tags=['gold', 'sla', 'compliance'],
     default_args=default_args,
 ) as dag:
@@ -132,7 +132,6 @@ with DAG(
     schedule=[gold_assets["sla_ready"]],
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    max_active_runs=1,
     tags=['gold', 'region', 'daily'],
     default_args=default_args,
 ) as dag:
@@ -151,7 +150,7 @@ for _report_name, _tags in [
         schedule=[gold_assets["health_daily_ready"]],
         start_date=datetime(2026, 1, 1),
         catchup=False,
-        max_active_runs=1,
+
         tags=_tags,
         default_args=default_args,
     ) as dag:

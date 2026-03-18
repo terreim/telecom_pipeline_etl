@@ -72,6 +72,7 @@ def staging_metadata_template() -> dict:
         "schema_version": 1,
         "layer": "staging",
         "table": None,
+        "partition": None,
         "batch_id": None,
         "status": None,
         "source_silver_keys": [],

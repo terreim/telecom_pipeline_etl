@@ -1,5 +1,6 @@
 import logging
 import time
+import re
 from datetime import datetime, timezone
 import pandas as pd
 
@@ -10,8 +11,6 @@ from shared.common.metadata import MetadataManager
 from shared.common.metadata_template import staging_metadata_template
 from shared.common.connections import get_clickhouse_hook, get_s3_credentials
 from shared.common.sql_builder import sql_ch_dim_station, sql_ch_dim_dict
-
-logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +75,65 @@ class ClickHouseLoader:
 
         soft_mask = issues.apply(_is_soft_only)
         return q_df[soft_mask].copy(), q_df[~soft_mask].copy()
+    
+    def ensure_db(self, db_name: str = CFG.schema_name) -> None:
+        """Ensure the ClickHouse database/schema exists."""
+        try:
+            self.ch_io.execute_query(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+            logger.info(f"Ensured ClickHouse database exists: {db_name}")
+            
+            return {"status": "success", "database": db_name}
+        
+        except Exception as e:
+            logger.error(f"Failed to ensure ClickHouse database {db_name}: {e}")
+            raise
+
+    def ensure_tables(self, ddl_path: str) -> dict:
+        try:
+            with open(ddl_path, 'r') as f:
+                ddl_sql = f.read()
+
+            statements = [s.strip() for s in ddl_sql.split(";") if s.strip()]
+            for stmt in statements:
+                name_match = re.search(
+                    r'CREATE\s+(?:TABLE|DICTIONARY)\s+IF\s+NOT\s+EXISTS\s+(\S+)',
+                    stmt, re.IGNORECASE
+                )
+                label = name_match.group(1) if name_match else "unknown"
+                logger.info(f"Ensuring ClickHouse table/dictionary exists: {label}")
+                self.ch_io.execute_query(stmt)
+
+            return {"status": "success", "details": f"Executed {len(statements)} DDL statements from {ddl_path}"}
+
+        except Exception as e:
+            logger.error(f"Failed to ensure ClickHouse staging DDL from {ddl_path}: {e}")
+            raise
+
+    def drop_tables(self, ddl_path: str, db_name: str = CFG.schema_name) -> dict:
+        """Drop all tables/views/dictionaries defined in a DDL file."""
+        try:
+            with open(ddl_path, 'r') as f:
+                ddl_sql = f.read()
+
+            objects = re.findall(
+                r'CREATE\s+((?:MATERIALIZED\s+VIEW|TABLE|DICTIONARY))\s+IF\s+NOT\s+EXISTS\s+(\S+)',
+                ddl_sql, re.IGNORECASE
+            )
+
+            dropped = []
+            for _, name in reversed(objects):
+                # Qualify with db_name if no schema prefix present
+                fqn = name if '.' in name else f"{db_name}.{name}"
+                stmt = f"DROP TABLE IF EXISTS {fqn}"
+                logger.info(f"Dropping: {stmt}")
+                self.ch_io.execute_query(stmt)
+                dropped.append(fqn)
+
+            return {"status": "success", "dropped": dropped}
+
+        except Exception as e:
+            logger.error(f"Failed to drop tables from DDL {ddl_path}: {e}")
+            raise
 
     def load_dim(self, schema, table_name, dim_df: pd.DataFrame, force_reload: bool = False) -> dict:
         """Load dimension data into ClickHouse and refresh the dictionary."""
@@ -115,125 +173,132 @@ class ClickHouseLoader:
     # Main
     # =========================================================================
 
-    def load_staging(
+    def list_unprocessed(
+        self,
+        silver_subpath: str,
+        lookback_range: int = 720,
+    ) -> list[dict]:
+        """Return serialisable descriptors for each unprocessed silver batch."""
+        return [
+            {"meta_key": meta_key, "silver_meta": silver_meta}
+            for meta_key, silver_meta in self.find_unprocessed_silver(
+                silver_table=silver_subpath, lookback_range=lookback_range
+            )
+        ]
+
+    def load_staging_single(
         self,
         staging_table: str,
         silver_subpath: str,
         batch_id: str,
-        lookback_range: int = 720,
+        meta_key: str,
+        silver_meta_file: dict,
         include_recoverable_quarantine: bool = True,
-    ) -> list[dict]:
-        """Load silver parquets into ClickHouse staging.
+    ) -> dict:
+        """Load ONE silver batch into ClickHouse staging.
 
-        For each unprocessed silver batch:
-          1. Read all silver (valid) parquets.
-          2. Optionally read quarantine parquets and re-admit rows that failed
-             only on soft numeric-range checks (jitter, duration, packet_loss,
-             latency). Those rows are tagged data_quality='quarantined' so
-             analysts can filter them, but they are present for late-arrival
-             recovery and completeness.
-          3. Insert the combined DataFrame into CH staging via S3 or VALUES.
+        Steps:
+          1. Read all silver (valid) parquets for this batch.
+          2. Optionally re-admit soft-fail quarantine rows.
+          3. Concat and INSERT into CH staging.
           4. Mark the silver metadata as loaded_to_warehouse=True.
         """
-        all_results = []
+        t0 = time.monotonic()
+        staging_meta = staging_metadata_template()
+        staging_meta['table'] = staging_table
+        staging_meta['batch_id'] = batch_id
 
-        for meta_key, silver_meta_file in self.find_unprocessed_silver(
-            silver_table=silver_subpath, lookback_range=lookback_range
-        ):
-            t0 = time.monotonic()
-            staging_meta = staging_metadata_template()
-            staging_meta['table'] = staging_table
-            staging_meta['batch_id'] = batch_id
+        silver_keys = silver_meta_file.get("data_keys", [])
+        partition = silver_meta_file.get("partition")
+        quarantine_keys = silver_meta_file.get("quarantine_keys", [])
 
-            silver_keys = silver_meta_file.get("data_keys", [])
-            quarantine_keys = silver_meta_file.get("quarantine_keys", [])
+        frames: list[pd.DataFrame] = []
+        recovered_count = 0
+        source_silver_keys = []
+        late_source_keys = []
 
-            frames: list[pd.DataFrame] = []
-            recovered_count = 0
-            source_silver_keys = []
-            late_source_keys = []
-
-            for s3_key in silver_keys:
-                try:
-                    df = self.s3_io.read_parquet(s3_key)
-                    df['data_quality'] = 'valid'
-                    frames.append(df)
-                    source_silver_keys.append(s3_key)
-                except Exception as e:
-                    logger.error(f"Failed to read silver parquet {s3_key}: {e} — skipping")
-
-            # ── 2. Recoverable quarantine records ─────────────────────────
-            if include_recoverable_quarantine and quarantine_keys:
-                for q_key in quarantine_keys:
-                    try:
-                        q_df = self.s3_io.read_parquet(q_key)
-                    except Exception as e:
-                        logger.warning(f"Failed to read quarantine parquet {q_key}: {e} — skipping")
-                        continue
-
-                    recoverable, unrecoverable = self._split_quarantine(q_df)
-
-                    if not recoverable.empty:
-                        recoverable['data_quality'] = 'quarantined'
-                        frames.append(recoverable)
-                        recovered_count += len(recoverable)
-                        late_source_keys.append(q_key)
-                        logger.info(
-                            f"Re-admitted {len(recoverable)} soft-fail records from quarantine: {q_key}"
-                        )
-
-                    if not unrecoverable.empty:
-                        logger.debug(
-                            f"Left {len(unrecoverable)} hard-fail records in quarantine: {q_key}"
-                        )
-
-            if not frames:
-                logger.info(f"No data to load for silver batch {meta_key}, marking done.")
-                staging_meta['status'] = 'skipped'
-                staging_meta['created_at'] = datetime.now(timezone.utc).isoformat()
-                staging_meta['processing_duration_seconds'] = round(time.monotonic() - t0, 2)
-                silver_meta_file['loaded_to_warehouse'] = True
-
-                self._write_staging_metadata(silver_subpath, batch_id, staging_meta)
-                self._mark_silver_loaded(meta_key, silver_meta_file)
-                
-                all_results.append(staging_meta)
-                continue
-
-            # ── 3. Combine and insert ─────────────────────────────────────
-            combined = pd.concat(frames, ignore_index=True)
-
+        for s3_key in silver_keys:
             try:
-                s3_key = self._insert_to_ch(combined, staging_table, silver_subpath, batch_id)
-                staging_meta['status'] = 'staging_complete'
-                staging_meta['data_key'] = s3_key
+                df = self.s3_io.read_parquet(s3_key)
+                df['data_quality'] = 'valid'
+                frames.append(df)
+                source_silver_keys.append(s3_key)
             except Exception as e:
-                logger.error(f"Failed to load staging for {meta_key}: {e}")
-                staging_meta['status'] = 'failed'
-                staging_meta['created_at'] = datetime.now(timezone.utc).isoformat()
-                staging_meta['processing_duration_seconds'] = round(time.monotonic() - t0, 2)
-                self._write_staging_metadata(silver_subpath, batch_id, staging_meta)
-                raise
+                logger.error(f"Failed to read silver parquet {s3_key}: {e} — skipping")
 
-            staging_meta['record_count'] = len(combined) - recovered_count
-            staging_meta['late_record_count'] = recovered_count
-            staging_meta['source_silver_keys'] = source_silver_keys
-            staging_meta['late_source_silver_keys'] = late_source_keys
-            staging_meta['is_reopened'] = recovered_count > 0
-            staging_meta['data_quality'] = 'mixed' if recovered_count > 0 else 'valid'
+        # ── 2. Recoverable quarantine records ─────────────────────────
+        if include_recoverable_quarantine and quarantine_keys:
+            for q_key in quarantine_keys:
+                try:
+                    q_df = self.s3_io.read_parquet(q_key)
+                except Exception as e:
+                    logger.warning(f"Failed to read quarantine parquet {q_key}: {e} — skipping")
+                    continue
+
+                recoverable, unrecoverable = self._split_quarantine(q_df)
+
+                if not recoverable.empty:
+                    recoverable['data_quality'] = 'quarantined'
+                    frames.append(recoverable)
+                    recovered_count += len(recoverable)
+                    late_source_keys.append(q_key)
+                    logger.info(
+                        f"Re-admitted {len(recoverable)} soft-fail records from quarantine: {q_key}"
+                    )
+
+                if not unrecoverable.empty:
+                    logger.debug(
+                        f"Left {len(unrecoverable)} hard-fail records in quarantine: {q_key}"
+                    )
+
+        partition_slug = partition.replace('/', '-').replace("=", "") if partition else "no_partition"
+
+        if not frames:
+            logger.info(f"No data to load for silver batch {meta_key}, marking done.")
+            staging_meta['status'] = 'skipped'
             staging_meta['created_at'] = datetime.now(timezone.utc).isoformat()
             staging_meta['processing_duration_seconds'] = round(time.monotonic() - t0, 2)
+            silver_meta_file['loaded_to_warehouse'] = True
 
-            self._write_staging_metadata(silver_subpath, batch_id, staging_meta)
+            self._write_staging_metadata(silver_subpath, partition_slug, staging_meta)
             self._mark_silver_loaded(meta_key, silver_meta_file)
+            return staging_meta
 
-            logger.info(
-                f"Staged {staging_meta['record_count']} valid + {recovered_count} recovered "
-                f"→ {staging_table}"
-            )
-            all_results.append(staging_meta)
+        # ── 3. Combine and insert ─────────────────────────────────────
+        combined = pd.concat(frames, ignore_index=True)
+        del frames
 
-        return all_results
+        try:
+            s3_key = self._insert_to_ch(combined, staging_table, silver_subpath, batch_id, partition=partition or "")
+            staging_meta['status'] = 'staging_complete'
+            staging_meta['data_key'] = s3_key
+        except Exception as e:
+            logger.error(f"Failed to load staging for {meta_key}: {e}")
+            staging_meta['status'] = 'failed'
+            staging_meta['created_at'] = datetime.now(timezone.utc).isoformat()
+            staging_meta['processing_duration_seconds'] = round(time.monotonic() - t0, 2)
+            self._write_staging_metadata(silver_subpath, partition_slug, staging_meta)
+            raise
+
+        staging_meta['record_count'] = len(combined) - recovered_count
+        staging_meta['partition'] = partition
+        staging_meta['late_record_count'] = recovered_count
+        staging_meta['source_silver_keys'] = source_silver_keys
+        staging_meta['late_source_silver_keys'] = late_source_keys
+        staging_meta['is_reopened'] = recovered_count > 0
+        staging_meta['data_quality'] = 'mixed' if recovered_count > 0 else 'valid'
+        staging_meta['created_at'] = datetime.now(timezone.utc).isoformat()
+        staging_meta['processing_duration_seconds'] = round(time.monotonic() - t0, 2)
+        del combined
+
+        self._write_staging_metadata(silver_subpath, partition_slug, staging_meta)
+        self._mark_silver_loaded(meta_key, silver_meta_file)
+
+        logger.info(
+            f"Staged {staging_meta['record_count']} valid + {recovered_count} recovered "
+            f"→ {staging_table}"
+        )
+        return staging_meta
 
     # =========================================================================
     # Internal helpers
@@ -245,9 +310,11 @@ class ClickHouseLoader:
         staging_table: str,
         silver_subpath: str,
         batch_id: str,
+        partition: str = "",
     ) -> str | None:
         """Write df to a temp S3 parquet and INSERT INTO CH via insert_with_fallback."""
-        s3_key = f"{self.metadata_prefix}/staging_tmp/{silver_subpath}/{batch_id}.parquet"
+        partition_slug = partition.replace("/", "-").replace("=", "") if partition else "no_partition"
+        s3_key = f"{self.metadata_prefix}/staging_tmp/{silver_subpath}/{partition_slug}/{batch_id}.parquet"
         written_key = self.s3_io.write_parquet(df, s3_key)
         s3_url = f"{self.s3_endpoint}/{self.s3_bucket}/{written_key}"
         self.ch_io.insert_with_fallback(df=df, s3_url=s3_url, ch_table=staging_table)

@@ -4,13 +4,13 @@
 -- AGGREGATING TABLES
 -- ============================================================================
 
-CREATE TABLE telecom.traffic_hourly (
+CREATE TABLE IF NOT EXISTS telecom.traffic_hourly (
     event_hour       DateTime,
     station_code     LowCardinality(String),
     operator_code    LowCardinality(String),
     region           LowCardinality(String),
     province         LowCardinality(String),
-    density          LowCardinality(String),
+    density_class          LowCardinality(String),
     technology       LowCardinality(String),
     total_bytes      AggregateFunction(sum, UInt64),
     session_count    AggregateFunction(count),
@@ -24,13 +24,13 @@ ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(event_hour)
 ORDER BY (event_hour, station_code, operator_code);
 
-CREATE TABLE telecom.traffic_daily (
+CREATE TABLE IF NOT EXISTS telecom.traffic_daily (
     event_date       Date,
     station_code     LowCardinality(String),
     operator_code    LowCardinality(String),
     region           LowCardinality(String),
     province         LowCardinality(String),
-    density          LowCardinality(String),
+    density_class          LowCardinality(String),
     technology       LowCardinality(String),
     total_bytes      AggregateFunction(sum, UInt64),
     session_count    AggregateFunction(count),
@@ -43,7 +43,7 @@ ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (event_date, station_code, operator_code);
 
-CREATE TABLE telecom.operator_daily (
+CREATE TABLE IF NOT EXISTS telecom.operator_daily (
     event_date       Date,
     operator_code    LowCardinality(String),
     region           LowCardinality(String),
@@ -70,7 +70,7 @@ SELECT
     operator_code,
     region,
     province,
-    density,
+    density_class,
     technology,
     sumState(bytes_total)           AS total_bytes,
     countState()                    AS session_count,
@@ -80,7 +80,7 @@ SELECT
     avgState(packet_loss_pct)       AS avg_packet_loss,
     avgState(jitter_ms)             AS avg_jitter
 FROM telecom.staging_traffic_cleaned
-GROUP BY event_hour, station_code, operator_code, region, province, density, technology;
+GROUP BY event_hour, station_code, operator_code, region, province, density_class, technology;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS telecom.mv_traffic_daily
 TO telecom.traffic_daily
@@ -91,7 +91,7 @@ SELECT
     operator_code,
     region,
     province,
-    density,
+    density_class,
     technology,
     sumState(bytes_total)           AS total_bytes,
     countState()                    AS session_count,
@@ -100,7 +100,7 @@ SELECT
     quantileState(0.95)(latency_ms) AS p95_latency,
     avgState(packet_loss_pct)       AS avg_packet_loss
 FROM telecom.staging_traffic_cleaned
-GROUP BY event_date, station_code, operator_code, region, province, density, technology;
+GROUP BY event_date, station_code, operator_code, region, province, density_class, technology;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS telecom.mv_operator_daily
 TO telecom.operator_daily
