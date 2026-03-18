@@ -430,3 +430,8 @@ Pipeline hiện rất yếu trước thay đổi schema:
 - [ ] Grafana dashboard cho health score, SLA compliance, anomaly detection
 - [ ] Alerting integration (Slack/email) khi health_score < 30 hoặc SLA breach
 - [ ] Dimension SCD Type-2 tracking trong ClickHouse (hiện chỉ latest snapshot)
+
+
+## License
+
+Dự án cá nhân. Credit author khi sử dụng
