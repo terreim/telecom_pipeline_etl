@@ -1,0 +1,57 @@
+"""
+Define common connections utilities for S3 and Postgres
+
+S3 Connections:
+    get_s3_hook: returns an S3Hook instance for the given connection ID
+    get_s3_credentials: returns the access key, secret key, and endpoint for the given S3 connection ID
+
+Postgres Connections:
+    pg_cursor: a context manager that yields a Postgres connection and cursor, and handles closing/rollback. READ-ONLY.
+"""
+
+from contextlib import contextmanager
+
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+# Hooks 
+def get_postgres_hook(conn_id: str) -> PostgresHook:
+    return PostgresHook(postgres_conn_id=conn_id)
+
+def get_s3_hook(conn_id: str) -> S3Hook:
+    return S3Hook(aws_conn_id=conn_id)
+
+def get_clickhouse_hook(conn_id: str) -> ClickHouseHook:
+    return ClickHouseHook(clickhouse_conn_id=conn_id)
+
+
+# Helpers
+def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
+    s3_hook = get_s3_hook(conn_id=conn_id)
+    
+    try:
+        creds = s3_hook.get_credentials()
+    except Exception as e:
+        raise ValueError(f"Could not retrieve credentials for S3 connection ID: {conn_id}. Error: {e}")
+    
+    s3_access_key = creds.access_key
+    s3_secret_key = creds.secret_key
+
+    conn = s3_hook.get_connection(conn_id=conn_id)
+    s3_endpoint = conn.extra_dejson.get("endpoint_url", "http://minio:9000")
+
+    return (s3_access_key, s3_secret_key, s3_endpoint)
+
+@contextmanager
+def pg_cursor(pg_hook: PostgresHook):
+    conn = pg_hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        yield conn, cursor
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()

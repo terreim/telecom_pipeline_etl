@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!-- Grant S3/SOURCES and Named Collection access to the default user (XML-managed) -->
+<clickhouse>
+    <users>
+        <default>
+            <named_collection_control>1</named_collection_control>
+            <show_named_collections>1</show_named_collections>
+            <show_named_collections_secrets>1</show_named_collections_secrets>
+            <grants>
+                <query>GRANT SOURCES ON *.*</query>
+            </grants>
+        </default>
+    </users>
+</clickhouse>
