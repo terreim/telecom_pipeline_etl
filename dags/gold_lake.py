@@ -23,8 +23,8 @@ Gold Logic DAGs
     gold_traffic_ready ──┐
     gold_metrics_ready ──┤──> health_hourly ──> anomaly_features
     gold_events_ready ───┘        │
-                                │ (fires on hour 23 only)
-                                ▼
+                                  │ (fires on hour 23 only)
+                                  ▼
                             health_daily_ready
                         ┌───┬────┼─────┬────────┐
                         ▼   ▼    ▼     ▼        ▼

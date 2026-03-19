@@ -200,7 +200,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
             e.incident_active,
             e.incident_type,
             e.maintenance_active
-            FROM {CFG.schema_name}.{CFG.station_staging_st} t
+            FROM {CFG.schema_name}.{CFG.station_staging_st} t FINAL
             LEFT JOIN (
                 SELECT
                     station_id,
@@ -211,7 +211,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
                     max(temperature_celsius) AS max_temp,
                     avg(uplink_throughput_mbps) AS avg_uplink_throughput,
                     avg(downlink_throughput_mbps) AS avg_downlink_throughput
-                FROM {CFG.schema_name}.{CFG.station_staging_pm}
+                FROM {CFG.schema_name}.{CFG.station_staging_pm} FINAL
                 WHERE metric_time >= '{hour_start}' AND metric_time <= '{hour_end}'
                     AND is_deleted = false
                 GROUP BY station_id
@@ -230,7 +230,7 @@ def sql_gold_health_hourly(year: int, month: int, day: int, hour: int) -> str:
                         event_type = 'incident_start'
                     ) AS incident_type,
                     max(event_type = 'maintenance_start') AS maintenance_active
-                FROM {CFG.schema_name}.{CFG.station_staging_se}
+                FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
                 WHERE event_time >= '{hour_start}' AND event_time <= '{hour_end}'
                     AND is_deleted = false
                 GROUP BY station_id
@@ -332,7 +332,7 @@ def sql_gold_slac_hourly(year: int, month: int, day: int) -> str:
                 sumIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS total_incident_min,
                 maxIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS longest_incident_min,
                 avgIf(JSONExtractFloat(metadata::String, 'duration_min'), event_type = 'incident_end') AS mttr_min
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE toDate(event_time) = '{report_date}'
                 AND is_deleted = false
             GROUP BY station_id, event_date
@@ -412,7 +412,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
                 event_time AS incident_start,
                 metadata AS start_meta,
                 row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE event_type = 'incident_start'
                 AND toDate(event_time) = '{report_date}'
                 AND is_deleted = false
@@ -423,7 +423,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
                 event_time AS incident_end,
                 metadata AS end_meta,
                 row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE event_type = 'incident_end'
                 AND toDate(event_time) >= '{report_date}'
                 AND toDate(event_time) <= toDate('{report_date}') + 1
@@ -448,7 +448,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
                 uniq(st.imsi_hash) AS affected_subscribers,
                 sum(st.bytes_up + st.bytes_down) AS incident_bytes
             FROM incident_pairs ip
-            LEFT JOIN {CFG.schema_name}.{CFG.station_staging_st} st
+            LEFT JOIN (SELECT * FROM {CFG.schema_name}.{CFG.station_staging_st} FINAL) st
                 ON ip.station_id = st.station_id
                 AND st.event_time >= ip.incident_start
                 AND st.event_time <= coalesce(ip.incident_end, now())
@@ -477,7 +477,7 @@ def sql_gold_outage_report(year: int, month: int, day: int) -> str:
                 station_id,
                 toHour(event_time) AS hour_of_day,
                 sum(bytes_up + bytes_down) / 7 AS avg_hourly_bytes
-            FROM {CFG.schema_name}.{CFG.station_staging_st}
+            FROM {CFG.schema_name}.{CFG.station_staging_st} FINAL
             WHERE toDate(event_time) >= '{baseline_start}'
                 AND toDate(event_time) < '{report_date}'
                 AND is_deleted = false
@@ -581,7 +581,7 @@ def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
                 event_time AS maintenance_start,
                 metadata AS start_meta,
                 row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE event_type = 'maintenance_start'
                 AND toDate(event_time) = '{report_date}'
                 AND is_deleted = false
@@ -592,7 +592,7 @@ def sql_gold_maintenance_report(year: int, month: int, day: int) -> str:
                 event_time AS maintenance_end,
                 metadata AS end_meta,
                 row_number() OVER (PARTITION BY station_id ORDER BY event_time) AS rn
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE event_type = 'maintenance_end'
                 AND toDate(event_time) >= '{report_date}'
                 AND toDate(event_time) <= toDate('{report_date}') + 1
@@ -652,13 +652,13 @@ def sql_gold_handover_report(year: int, month: int, day: int) -> str:
             ) AS unique_subscribers,
             src_traffic.avg_latency AS avg_latency_before_ms,
             tgt_traffic.avg_latency AS avg_latency_after_ms
-        FROM {CFG.schema_name}.{CFG.station_staging_se} e
+        FROM {CFG.schema_name}.{CFG.station_staging_se} e FINAL
         LEFT JOIN (
             SELECT
                 station_id,
                 toDate(event_time) AS traffic_date,
                 avg(latency_ms) AS avg_latency
-            FROM {CFG.schema_name}.{CFG.station_staging_st}
+            FROM {CFG.schema_name}.{CFG.station_staging_st} FINAL
             WHERE toDate(event_time) = '{report_date}'
                 AND is_deleted = false
             GROUP BY station_id, traffic_date
@@ -670,7 +670,7 @@ def sql_gold_handover_report(year: int, month: int, day: int) -> str:
                 station_id,
                 toDate(event_time) AS traffic_date,
                 avg(latency_ms) AS avg_latency
-            FROM {CFG.schema_name}.{CFG.station_staging_st}
+            FROM {CFG.schema_name}.{CFG.station_staging_st} FINAL
             WHERE toDate(event_time) = '{report_date}'
                 AND is_deleted = false
             GROUP BY station_id, traffic_date
@@ -702,7 +702,7 @@ def sql_gold_alarm_report(year: int, month: int, day: int) -> str:
                 countIf(severity = 'critical') AS critical_count,
                 count() AS total_alarm_count,
                 topK(1)(description)[1] AS top_alarm_description
-            FROM {CFG.schema_name}.{CFG.station_staging_se}
+            FROM {CFG.schema_name}.{CFG.station_staging_se} FINAL
             WHERE event_type = 'alarm'
                 AND toDate(event_time) = '{report_date}'
                 AND is_deleted = false

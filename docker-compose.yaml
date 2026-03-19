@@ -33,7 +33,7 @@ x-airflow-common:
   deploy:
     resources:
       limits:
-        memory: 1G  # TODO: Limit each Airflow service to 512MB on prod
+        memory: 1G
       reservations:
         memory: 512M
   environment:
@@ -168,6 +168,59 @@ services:
       timeout: 30s
       retries: 50
       start_period: 30s
+    restart: always
+    networks:
+      - pipeline-net
+
+  # ============================================================================
+  # Spark Cluster
+  # ============================================================================
+
+  spark-master:
+    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    container_name: spark_master
+    command: /opt/spark/sbin/start-master.sh      # ← entrypoint script that starts the master daemon
+    ports:
+      - "7077:7077"    # Spark master port — workers and spark-submit connect here
+      - "8081:8080"    # Spark Master Web UI (8080 taken by Airflow, remap to 8081)
+    environment:
+      SPARK_MASTER_HOST: spark-master              # ← tells master to bind to this hostname
+      SPARK_NO_DAEMONIZE: "true"                   # ← run in foreground (Docker needs this, otherwise
+                                                   #    the script daemonizes and the container exits)
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks:
+      - pipeline-net
+
+  spark-worker:
+    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    container_name: spark_worker_1
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    #         ↑ tells this worker to register with the master at that address
+    environment:
+      SPARK_WORKER_MEMORY: 1g                      # ← how much RAM this worker offers to executors
+      SPARK_WORKER_CORES: 2                        # ← how many CPU cores this worker offers
+      SPARK_NO_DAEMONIZE: "true"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1536M                            # ← headroom above WORKER_MEMORY for JVM overhead
+        reservations:
+          memory: 1G
     restart: always
     networks:
       - pipeline-net

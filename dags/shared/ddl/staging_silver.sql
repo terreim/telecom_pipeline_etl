@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS telecom.staging_traffic_cleaned
 (
 	traffic_id              UInt64,
 	station_id              UInt32,
-	event_time              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	event_time              DateTime64(3),
 	imsi_hash               String,
 	tmsi                    String,
 	ip_address              String,
@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS telecom.staging_traffic_cleaned
 	jitter_ms               Float64,
 	packet_loss_pct         Float64,
 	connection_duration_ms  UInt32,
-	created_at              DateTime64(3, 'Asia/Ho_Chi_Minh'),
-	updated_at              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	created_at              DateTime64(3),
+	updated_at              DateTime64(3),
 	is_deleted              Bool,
 	is_valid                Bool,
 	quality_issues          String,
@@ -36,11 +36,11 @@ CREATE TABLE IF NOT EXISTS telecom.staging_traffic_cleaned
 	dim_match_status        LowCardinality(String),
 	bytes_total             UInt64,
 	event_date              DateTime,
-	event_hour              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	event_hour              DateTime64(3),
 	is_high_latency         Bool,
-	transformed_at          DateTime64(3, 'Asia/Ho_Chi_Minh')
+	transformed_at          DateTime64(3)
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(updated_at)
 PARTITION BY toYYYYMM(event_time)
 ORDER BY (station_id, event_time, traffic_id)
 TTL event_time + INTERVAL 90 DAY
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS telecom.staging_metrics_cleaned
 (
 	metric_id                UInt64,
 	station_id               UInt32,
-	metric_time              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	metric_time              DateTime64(3),
 	cpu_usage_pct            Float32,
 	memory_usage_pct         Float32,
 	disk_usage_pct           Float32,
@@ -63,8 +63,8 @@ CREATE TABLE IF NOT EXISTS telecom.staging_metrics_cleaned
 	signal_strength_dbm      Float32,
 	frequency_band           LowCardinality(String),
 	channel_utilization_pct  Float32,
-	created_at               DateTime64(3, 'Asia/Ho_Chi_Minh'),
-	updated_at               DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	created_at               DateTime64(3),
+	updated_at               DateTime64(3),
 	is_deleted               Bool,
 	is_valid                 Bool,
 	quality_issues           String,
@@ -77,9 +77,9 @@ CREATE TABLE IF NOT EXISTS telecom.staging_metrics_cleaned
 	density_class            LowCardinality(String),
 	technology               LowCardinality(String),
 	dim_match_status         LowCardinality(String),
-	transformed_at 		     DateTime64(3, 'Asia/Ho_Chi_Minh')
+	transformed_at 		     DateTime64(3)
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(updated_at)
 PARTITION BY toYYYYMM(metric_time)
 ORDER BY (station_id, metric_time, metric_id)
 TTL metric_time + INTERVAL 90 DAY
@@ -90,14 +90,14 @@ CREATE TABLE IF NOT EXISTS telecom.staging_events_cleaned
 (
 	event_id                UInt64,
 	station_id              UInt32,
-	event_time              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	event_time              DateTime64(3),
 	event_type              LowCardinality(String),
 	severity                LowCardinality(String),
 	description             LowCardinality(String),
 	metadata                JSON,
 	target_station_id       UInt32 DEFAULT 0,
-	created_at              DateTime64(3, 'Asia/Ho_Chi_Minh'),
-	updated_at              DateTime64(3, 'Asia/Ho_Chi_Minh'),
+	created_at              DateTime64(3),
+	updated_at              DateTime64(3),
 	is_deleted              Bool,
 	is_valid                Bool,
 	quality_issues          String,
@@ -110,9 +110,9 @@ CREATE TABLE IF NOT EXISTS telecom.staging_events_cleaned
 	density_class           LowCardinality(String),
 	technology              LowCardinality(String),
 	dim_match_status        LowCardinality(String),
-	transformed_at 			DateTime64(3, 'Asia/Ho_Chi_Minh')
+	transformed_at 			DateTime64(3)
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(updated_at)
 PARTITION BY toYYYYMM(event_time)
 ORDER BY (station_id, event_time, event_id)
 TTL event_time + INTERVAL 90 DAY
