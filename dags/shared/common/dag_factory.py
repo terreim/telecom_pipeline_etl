@@ -65,14 +65,16 @@ class DagFactory:
             if context['run_id'].startswith('manual__'):
                 return {"manual": True}
 
+            interval_end = context.get('data_interval_end')
+            if interval_end is None:
+                return {"asset_triggered": True}
+
             if boundary_type == 'hourly':
-                interval_end = context['data_interval_end']
                 if interval_end.minute != 0:
                     raise AirflowSkipException(
                         f"Not hour boundary (minute={interval_end.minute})"
                     )
             elif boundary_type == 'daily':
-                interval_end = context['data_interval_end']
                 if interval_end.hour != 0 or interval_end.minute != 0:
                     raise AirflowSkipException(
                         f"Not day boundary (hour={interval_end.hour}, minute={interval_end.minute})"
@@ -300,11 +302,16 @@ class GoldDag(SchemaManager, DagFactory):
             aggregator = GoldAggregator()
             report = aggregator.reports()[report_name]
 
-            hours = set()
+            per_signal = []
             for events in context['triggering_asset_events'].values():
+                signal_hours = set()
                 for event in events:
                     for h in event.extra.get("hours", []):
-                        hours.add(tuple(h))
+                        signal_hours.add(tuple(h))
+                if signal_hours:
+                    per_signal.append(signal_hours)
+
+            hours = set.intersection(*per_signal) if per_signal else set()
 
             return [
                 aggregator.aggregate(report, year, month, day, hour)

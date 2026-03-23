@@ -56,11 +56,18 @@ with DAG(
         aggregator = GoldAggregator()
         report = aggregator.reports()["health_hourly"]
 
-        all_hours = set()
+        # Intersect hours across signals — only process hours where every
+        # upstream source has staged data, so the health report is complete.
+        per_signal = []
         for events in context['triggering_asset_events'].values():
+            signal_hours = set()
             for event in events:
                 for h in event.extra.get("hours", []):
-                    all_hours.add(tuple(h))
+                    signal_hours.add(tuple(h))
+            if signal_hours:
+                per_signal.append(signal_hours)
+
+        all_hours = set.intersection(*per_signal) if per_signal else set()
 
         if not all_hours and context['run_id'].startswith('manual__'):
             trigger_str = context['params'].get("trigger_time", "")

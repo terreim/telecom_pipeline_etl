@@ -60,10 +60,10 @@ x-airflow-common:
     # Pre-configured Connections (Zero-Config Startup)
     # -------------------------------------------------------------------------
     # MinIO Connection (S3-compatible) - uses Amazon provider
-    # Format: aws://<access_key>:<secret_key>@?endpoint_url=<url>&region_name=<region>
-    # Note: endpoint_url must be URL-encoded (http://minio:9000 -> http%3A%2F%2Fminio%3A9000)
-    AIRFLOW_CONN_AWS_DEFAULT: 'aws://minioadmin:minioadmin@?endpoint_url=http%3A%2F%2Fminio%3A9000&region_name=us-east-1'
-    
+    # JSON format needed for nested service_config (path-style addressing for MinIO)
+    AIRFLOW_CONN_AWS_DEFAULT: '{"conn_type": "aws", "login": "minioadmin", "password": "minioadmin", "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1", "service_config": {"s3": {"addressing_style": "path"}}}}'
+    AIRFLOW_CONN_MINIO_DEFAULT: '{"conn_type": "aws", "login": "minioadmin", "password": "minioadmin", "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1", "service_config": {"s3": {"addressing_style": "path"}}}}'
+
     # ClickHouse Connection - uses airflow-clickhouse-plugin
     # Using JSON format for explicit control (avoids URI parsing issues)
     # The plugin uses clickhouse-driver (native protocol on port 9000)
@@ -194,7 +194,7 @@ services:
         reservations:
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8081 || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -535,12 +535,14 @@ services:
         mc mb --ignore-existing myminio/staging           # Cleaned/transformed data
         mc mb --ignore-existing myminio/warehouse         # Final analytics-ready data
         mc mb --ignore-existing myminio/clickhouse-s3     # ClickHouse external storage
+        mc mb --ignore-existing myminio/station-lake      # Telecom ELT data lake
 
         echo "Setting bucket policies..."
         mc anonymous set download myminio/landing-zone
         mc anonymous set download myminio/staging
         mc anonymous set download myminio/warehouse
         mc anonymous set download myminio/clickhouse-s3
+        mc anonymous set download myminio/station-lake
 
         echo "Bucket initialization complete!"
         mc ls myminio/
