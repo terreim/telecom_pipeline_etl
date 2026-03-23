@@ -81,6 +81,7 @@ pluggy==1.6.0
 protobuf==6.33.2
 psutil==7.2.1
 psycopg2-binary==2.9.11
+py4j==0.10.9.9
 pyarrow==23.0.0
 pycparser==2.23
 pydantic==2.12.5
@@ -88,6 +89,7 @@ pydantic_core==2.41.5
 Pygments==2.19.2
 pygtrie==2.5.0
 PyJWT==2.10.1
+pyspark==4.1.1
 python-daemon==3.1.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1

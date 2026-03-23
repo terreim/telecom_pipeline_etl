@@ -1,6 +1,5 @@
 # Secrets
 .env
-dags/station_dags/.env
 
 # Python cache
 __pycache__/
@@ -15,6 +14,3 @@ plugins/
 # Virtualenv & pip cache
 venv/
 pip-cache/
-
-# Old files
-telecom_simulator.py
