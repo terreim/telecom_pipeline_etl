@@ -8,11 +8,12 @@ from pathlib import Path
 from airflow.sdk import Asset, Metadata
 from airflow.sdk import DAG, task
 from airflow.exceptions import AirflowSkipException
-from airflow.task.trigger_rule import TriggerRule
+from airflow.utils.trigger_rule import TriggerRule
 
 from shared.common.config import CFG
 from shared.util.bronze_extractor import BronzeExtractor
 from shared.util.silver_transformer import SilverTransformer
+from shared.util.spark_silver_transformer import SparkSilverTransformer
 from shared.util.staging_loader import ClickHouseLoader
 from shared.util.gold_aggregator import GoldAggregator
 
@@ -149,6 +150,42 @@ class SilverDag(DagFactory):
 
         return transform
 
+class SparkSilverDag(DagFactory):
+    def __init__(
+            self,
+            start_date: datetime = datetime(2026, 1, 1),
+            catchup: bool = False,
+            max_active_runs: int = 1,
+            tags: list[str] = None,
+            postgres_conn_id: str = CFG.postgres_conn_id,
+        ):
+        super().__init__(start_date, catchup, max_active_runs, tags)
+        self._postgres_conn_id = postgres_conn_id
+
+    def create_spark_silver_task(
+            self,
+            bronze_table: str,
+            silver_subpath: str,
+            transform_method: str,
+            outlets: list[Asset] | None = None,
+            lookback_hours: int = 720,
+            pool: str = "silver_transform_pool",
+        ) -> Callable:
+
+        pg_conn_id = self._postgres_conn_id
+
+        @task(outlets=outlets or [], task_id=f"spark_transform_{bronze_table}", pool=pool)
+        def transform(**context):
+            transformer = SparkSilverTransformer(postgres_conn_id=pg_conn_id)
+            fn = getattr(transformer, transform_method)
+            return fn(
+                table_name=bronze_table,
+                silver_subpath=silver_subpath,
+                batch_id=f"{bronze_table[:2]}_{context['run_id']}",
+                lookback_range=lookback_hours,
+            )
+
+        return transform
 
 class SchemaManager:
     def __init__(self, ddl_path: Path | None = None, **kwargs):

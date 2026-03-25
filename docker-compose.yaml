@@ -55,6 +55,11 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     AIRFLOW_TEMP_DIR: /opt/airflow/etl_temp
+    # PySpark reads this env var (not spark.pyspark.python config) to decide
+    # which Python binary executors should use.  Must point to 3.12 on the
+    # Spark worker so driver and executor versions match.
+    PYSPARK_PYTHON: /usr/bin/python3.12
+    PYSPARK_DRIVER_PYTHON: python3
 
     # -------------------------------------------------------------------------
     # Pre-configured Connections (Zero-Config Startup)
@@ -76,6 +81,8 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - D:\ETL_Temp:/opt/airflow/etl_temp
+    - spark-extra-jars:/opt/spark-extra-jars:ro
+
   user: "${AIRFLOW_UID:-50000}:0"
   networks:
     - pipeline-net
@@ -176,8 +183,26 @@ services:
   # Spark Cluster
   # ============================================================================
 
-  spark-master:
+  # --------------------------------------------------------------------------
+  # Spark JAR initializer (one-shot)
+  # Downloads hadoop-aws + aws-java-sdk-bundle into a shared volume so that
+  # both master and worker can read S3A (MinIO).  Runs once, then exits.
+  # --------------------------------------------------------------------------
+  spark-init:
     image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    container_name: spark_init
+    user: root                                     # ← needs write access to the volume
+    entrypoint: ["bash", "/scripts/download-spark-jars.sh"]
+    volumes:
+      - spark-extra-jars:/opt/spark-extra-jars     # ← shared volume for the JARs
+      - ./spark-scripts/download-spark-jars.sh:/scripts/download-spark-jars.sh:ro
+    networks:
+      - pipeline-net
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.spark
     container_name: spark_master
     command: /opt/spark/sbin/start-master.sh      # ← entrypoint script that starts the master daemon
     ports:
@@ -187,6 +212,15 @@ services:
       SPARK_MASTER_HOST: spark-master              # ← tells master to bind to this hostname
       SPARK_NO_DAEMONIZE: "true"                   # ← run in foreground (Docker needs this, otherwise
                                                    #    the script daemonizes and the container exits)
+      # ↓ tells Spark JVM to load the extra JARs (hadoop-aws + AWS SDK)
+      SPARK_EXTRA_CLASSPATH: "/opt/spark-extra-jars/*"
+    volumes:
+      - spark-extra-jars:/opt/spark-extra-jars:ro  # ← same shared volume, read-only
+      - .:/opt/spark/work-dir                      # ← mounts project root so scripts are accessible
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro  # ← default configs for spark-submit
+    depends_on:
+      spark-init:
+        condition: service_completed_successfully  # ← wait for JARs to be downloaded
     deploy:
       resources:
         limits:
@@ -204,7 +238,9 @@ services:
       - pipeline-net
 
   spark-worker:
-    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
     container_name: spark_worker_1
     command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
     #         ↑ tells this worker to register with the master at that address
@@ -212,15 +248,22 @@ services:
       SPARK_WORKER_MEMORY: 1g                      # ← how much RAM this worker offers to executors
       SPARK_WORKER_CORES: 2                        # ← how many CPU cores this worker offers
       SPARK_NO_DAEMONIZE: "true"
+      PYSPARK_PYTHON: /usr/bin/python3.12
+      PYSPARK_DRIVER_PYTHON: /usr/bin/python3.12
+      # ↓ worker also needs the JARs — executors run here, not on the master
+      SPARK_EXTRA_CLASSPATH: "/opt/spark-extra-jars/*"
+    volumes:
+      - spark-extra-jars:/opt/spark-extra-jars:ro  # ← same shared volume, read-only
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     depends_on:
       spark-master:
         condition: service_healthy
     deploy:
       resources:
         limits:
-          memory: 1536M                            # ← headroom above WORKER_MEMORY for JVM overhead
+          memory: 1G                               
         reservations:
-          memory: 1G
+          memory: 512M
     restart: always
     networks:
       - pipeline-net
@@ -635,6 +678,7 @@ volumes:
   zookeeper-log:
   clickhouse-data:
   clickhouse-logs:
+  spark-extra-jars:                              # ← persists downloaded S3A JARs across restarts
 
 # ============================================================================
 # Networks

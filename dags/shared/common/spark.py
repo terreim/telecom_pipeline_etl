@@ -36,6 +36,15 @@ def get_spark_session(
         # Parquet defaults
         .config("spark.sql.parquet.mergeSchema", "false")
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        # Force Airflow to read jars
+        .config("spark.driver.extraClassPath", "/opt/spark-extra-jars/*")
+        .config("spark.executor.extraClassPath", "/opt/spark-extra-jars/*")
+        # Force worker and driver to use Python3.12
+        .config("spark.pyspark.python", "/usr/bin/python3.12")
+        .config("spark.pyspark.driver.python", "/usr/bin/python3.12")
+        .config("spark.executorEnv.PYSPARK_PYTHON", "/usr/bin/python3.12")
+        .config("spark.pyspark.worker.reuse", "false")
+
     )
 
     return builder.getOrCreate()

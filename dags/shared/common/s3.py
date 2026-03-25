@@ -160,7 +160,7 @@ class S3IO:
             tmp_path = tmp_file.name
         try:
             table_pa = pa.Table.from_pandas(df, preserve_index=False)
-            pq.write_table(table_pa, tmp_path, compression="SNAPPY")
+            pq.write_table(table_pa, tmp_path, compression="SNAPPY", coerce_timestamps="us")
             if os.path.getsize(tmp_path) == 0:
                 raise ValueError(f"Parquet serialized to 0 bytes for key {s3_key} — df shape: {df.shape}, dtypes: {df.dtypes.to_dict()}")
             self.s3_hook.load_file(
