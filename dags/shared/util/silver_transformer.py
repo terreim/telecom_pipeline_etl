@@ -27,6 +27,7 @@ from shared.common.metadata_template import silver_metadata_template
 from shared.common.failure_recovery import write_failure_metadata
 from shared.common.watermark import S3WatermarkStore
 from shared.common.validators import validate_traffic, validate_events, validate_metrics, validate_station_dimension
+from shared.common.schema_registry import REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,34 @@ class SilverTransformer:
             raise
 
     # =========================================================================
+    # Schema Drift Detection
+    # =========================================================================
+
+    def _reconcile_with_contract(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
+        """Compare incoming DataFrame against schema contract and reconcile.
+
+        - Missing required columns → raise (pipeline must stop)
+        - Missing expected columns → NULL-fill (validation will flag rows)
+        - Missing passthrough columns → NULL-fill (staging DDL expects them)
+        - New unknown columns → kept as-is (auto-passthrough)
+        """
+        contract = REGISTRY.get(table_name)
+        drift = contract.detect_drift(set(df.columns))
+        drift.log()
+
+        if drift.is_breaking:
+            raise RuntimeError(
+                f"Breaking schema drift — cannot process {table_name}.\n"
+                f"{drift.summary()}"
+            )
+
+        for col in drift.missing_expected | drift.missing_passthrough:
+            df[col] = None
+            logger.warning("NULL-filled missing column '%s' in %s", col, table_name)
+
+        return df
+
+    # =========================================================================
     # Data Quality Validation
     # =========================================================================
 
@@ -99,10 +128,16 @@ class SilverTransformer:
     def _add_derived_columns_traffic(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        df['bytes_total'] = df['bytes_up'].fillna(0) + df['bytes_down'].fillna(0)
-        df['event_date'] = df['event_time'].dt.date
-        df['event_hour'] = df['event_time'].dt.floor('h')
-        df['is_high_latency'] = df['latency_ms'] > 100
+        if 'bytes_up' in df.columns and 'bytes_down' in df.columns:
+            df['bytes_total'] = df['bytes_up'].fillna(0) + df['bytes_down'].fillna(0)
+        else:
+            df['bytes_total'] = 0
+
+        if 'event_time' in df.columns:
+            df['event_date'] = df['event_time'].dt.date
+            df['event_hour'] = df['event_time'].dt.floor('h')
+
+        df['is_high_latency'] = df['latency_ms'] > 100 if 'latency_ms' in df.columns else False
         df['transformed_at'] = pd.Timestamp.now('UTC')
         return df
     
@@ -213,6 +248,7 @@ class SilverTransformer:
                     continue
                 logger.info(f"Read {len(df)} records from {data_key}")
 
+                df = self._reconcile_with_contract(df, table_name)
                 df = validate_fn(df)
                 if enrich:
                     df = self._enrich_with_dimensions(df)

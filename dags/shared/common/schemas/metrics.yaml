@@ -1,0 +1,127 @@
+# ─── Table Identity ───────────────────────────────────────────
+table:
+  source_name: performance_metrics
+  primary_key: metric_id
+  time_column: metric_time
+  cdc_column: updated_at
+
+# ─── Source Columns ───────────────────────────────────────────
+columns:
+  metric_id:
+    category: required
+    pg_type: bigint
+    ch_type: UInt64
+
+  station_id:
+    category: required
+    pg_type: integer
+    ch_type: UInt32
+    validate: { not_null: true }
+
+  metric_time:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+    validate: { not_null: true, no_future: true }
+
+  updated_at:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+
+  created_at:
+    category: expected
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+
+  cpu_usage_pct:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: cpu_range }
+
+  memory_usage_pct:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: memory_range }
+
+  disk_usage_pct:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: disk_range }
+
+  temperature_celsius:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: temperature_range }
+
+  power_consumption_watts:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: power_range }
+
+  uplink_throughput_mbps:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: throughput_range }
+
+  downlink_throughput_mbps:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: throughput_range }
+
+  active_subscribers:
+    category: expected
+    pg_type: bigint
+    ch_type: UInt64
+    validate: { min: 0 }
+
+  signal_strength_dbm:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: signal_strength_range }
+
+  frequency_band:
+    category: expected
+    pg_type: varchar
+    ch_type: "LowCardinality(String)"
+    validate: { domain: valid_frequency_bands }
+
+  channel_utilization_pct:
+    category: expected
+    pg_type: real
+    ch_type: Float32
+    validate: { range: channel_util_range }
+
+  is_deleted:
+    category: passthrough
+    pg_type: boolean
+    ch_type: Bool
+
+# ─── Pipeline-Added Columns ──────────────────────────────────
+derived:
+  transformed_at:
+    ch_type: DateTime64(3)
+    expression: "now(UTC)"
+
+enrichment:
+  station_code:     { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_code:    { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_name:    { ch_type: String,                   source: dim_station }
+  province:         { ch_type: "LowCardinality(String)", source: dim_station }
+  district:         { ch_type: String,                   source: dim_station }
+  region:           { ch_type: "LowCardinality(String)", source: dim_station }
+  density_class:    { ch_type: "LowCardinality(String)", source: dim_station }
+  technology:       { ch_type: "LowCardinality(String)", source: dim_station }
+  dim_match_status: { ch_type: "LowCardinality(String)", source: pipeline }
+
+quality:
+  is_valid:        { ch_type: Bool }
+  quality_issues:  { ch_type: String }

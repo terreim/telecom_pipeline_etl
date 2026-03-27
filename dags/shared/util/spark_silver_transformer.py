@@ -12,6 +12,7 @@ SilverTransformer iterates over the metadata partition of each bronze tables, id
 from datetime import datetime
 import time
 import re
+from uuid import uuid4
 
 import logging
 from typing import Optional
@@ -26,6 +27,7 @@ from pyspark.sql.functions import (
     date_trunc,
     current_timestamp,
 )
+from py4j.protocol import Py4JJavaError, Py4JNetworkError
 
 from shared.common.config import CFG
 from shared.common.spark import get_spark_session
@@ -74,7 +76,7 @@ class SparkSilverTransformer:
         try:
             pandas_df = self.pg_hook.get_pandas_df(sql=sql_dim_station())
             self._station_dim = self.spark.createDataFrame(pandas_df)
-            logger.info(f"Loaded {self._station_dim.count()} station dimension records")
+            logger.info(f"Loaded station dimension records")
             return self._station_dim
         
         except Exception as e:
@@ -106,9 +108,9 @@ class SparkSilverTransformer:
             )
         )
 
-        missing_count = df.filter(col('dim_match_status') == 'station_missing').count()
-        if missing_count > 0:
-            logger.warning(f"{missing_count} records missing station dimension match")
+        is_missing = df.filter(col('dim_match_status') == 'station_missing')
+        if is_missing.rdd.isEmpty() is False:
+            logger.warning(f"Data contains records missing station dimension match")
 
         return df
     
@@ -165,6 +167,40 @@ class SparkSilverTransformer:
         match = re.search(r'(year=\d{4}/month=\d{2}/day=\d{2}/hour=\d{2}/)', s3_key)
         return match.group(1) if match else ""
 
+    def _write_single_parquet(self, df: DataFrame, output_key: str) -> None:
+        """Write Spark DataFrame as a single parquet object at the exact S3 key."""
+        temp_key = f"{output_key}.__tmp__{uuid4().hex}/"
+        temp_uri = f"s3a://{self.s3_bucket}/{temp_key}"
+        output_uri = f"s3a://{self.s3_bucket}/{output_key}"
+
+        # Write one-part parquet to a temp prefix, then promote part file to final key.
+        df.coalesce(1).write.mode('overwrite').parquet(temp_uri)
+
+        jvm = self.spark.sparkContext._jvm
+        jsc = self.spark.sparkContext._jsc
+        fs = jvm.org.apache.hadoop.fs.FileSystem.get(jvm.java.net.URI(temp_uri), jsc.hadoopConfiguration())
+        temp_path = jvm.org.apache.hadoop.fs.Path(temp_uri)
+        output_path = jvm.org.apache.hadoop.fs.Path(output_uri)
+
+        try:
+            part_path = None
+            for status in fs.listStatus(temp_path):
+                name = status.getPath().getName()
+                if name.startswith('part-') and name.endswith('.parquet'):
+                    part_path = status.getPath()
+                    break
+
+            if part_path is None:
+                raise RuntimeError(f"No parquet part file found in temp path: {temp_uri}")
+
+            if fs.exists(output_path):
+                fs.delete(output_path, True)
+
+            if not fs.rename(part_path, output_path):
+                raise RuntimeError(f"Failed to move parquet part into final key: {output_uri}")
+        finally:
+            fs.delete(temp_path, True)
+
     # =========================================================================
     # Main Transform Methods
     # =========================================================================
@@ -185,26 +221,35 @@ class SparkSilverTransformer:
         and write to silver immediately — so that memory never holds more than
         one file's worth of data. The bronze file is located by checking unprocessed metadata entries, which point to the bronze parquet keys to read.
         """
-        all_results = []
-        for meta_key, bronze_meta in self.find_unprocessed_bronze(bronze_table=table_name, lookback_range=lookback_range):
-            t0 = time.monotonic()
-            silver_meta = silver_metadata_template()
-            silver_meta['table'] = silver_subpath
-            silver_meta['batch_id'] = batch_id
-            
-            total_records = 0
-            total_valid = 0
-            total_invalid = 0
-            written_silver_keys: list[str] = []
-            written_quarantine_keys: list[str] = []
-            partition = ""
-            
-            for data_key in bronze_meta.get("data_keys", []):
-                partition = self._extract_partition(data_key)
-                logger.info(f"Processing partition: {partition}")
+        try:
+            all_results = []
+            for meta_key, bronze_meta in self.find_unprocessed_bronze(bronze_table=table_name, lookback_range=lookback_range):
+                t0 = time.monotonic()
+                silver_meta = silver_metadata_template()
+                silver_meta['table'] = silver_subpath
+                silver_meta['batch_id'] = batch_id
+                
+                total_records = 0
+                total_valid = 0
+                total_invalid = 0
+                written_silver_keys: list[str] = []
+                written_quarantine_keys: list[str] = []
+                partition = ""
+                
+                data_keys = bronze_meta.get("data_keys", [])
+                if not data_keys:
+                    continue
+
+                # Extract partition from first key
+                partition = self._extract_partition(data_keys[0])
+                logger.info(f"Processing partition: {partition} with {len(data_keys)} files")
 
                 try:
-                    df = self.spark.read.parquet(f"s3a://{self.s3_bucket}/{data_key}")
+                    # Read all bronze files at once
+                    paths = [f"s3a://{self.s3_bucket}/{k}" for k in data_keys]
+                    df = self.spark.read.parquet(*paths)
+                except Py4JNetworkError:
+                    raise
                 except Exception as e:
                     failure_key = write_failure_metadata(
                         mm=self.meta,
@@ -213,7 +258,7 @@ class SparkSilverTransformer:
                         table_name=table_name,
                         batch_id=batch_id,
                         stage="read_bronze",
-                        source_key=data_key,
+                        source_key=",".join(data_keys),
                         source_metadata_key=meta_key,
                         error=e,
                         s3_hook=None,
@@ -221,7 +266,7 @@ class SparkSilverTransformer:
                         subpath=silver_subpath,
                     )
                     logger.error(
-                        f"Skipping unreadable bronze file {data_key}: {e}. "
+                        f"Skipping unreadable bronze batch with {len(data_keys)} files: {e}. "
                         f"Failure metadata written to {failure_key}"
                     )
                     continue
@@ -235,55 +280,46 @@ class SparkSilverTransformer:
                 valid_df = df.filter(col('is_valid') == True)
                 invalid_df = df.filter(col('is_valid') == False)
 
-                file_valid = valid_df.count()
-                file_invalid = invalid_df.count()
-                file_records = file_valid + file_invalid
+                total_valid = valid_df.count()
+                total_invalid = invalid_df.count()
+                total_records = total_valid + total_invalid
 
-                total_valid += file_valid
-                total_invalid += file_invalid
-                total_records += file_records
-
-                bronze_filename = data_key.rsplit('/', 1)[-1].replace('.parquet', '')
-                bronze_filename = bronze_filename.replace(':', '-')
-
-                if file_valid > 0:
-                    silver_key = (
-                        f"{self.silver_prefix}/{silver_subpath}/{partition}{bronze_filename}.parquet"
-                    )
-                    valid_df.write.mode('overwrite').parquet(f"s3a://{self.s3_bucket}/{silver_key}")
+                if total_valid > 0:
+                    silver_key = f"{self.silver_prefix}/{silver_subpath}/{partition}batch.parquet"
+                    self._write_single_parquet(valid_df, silver_key)
                     written_silver_keys.append(silver_key)
 
-                if file_invalid > 0:
-                    q_key = (
-                        f"{self.quarantine_prefix}/{silver_subpath}/{partition}{bronze_filename}.parquet"
-                    )
-                    invalid_df.write.mode('overwrite').parquet(f"s3a://{self.s3_bucket}/{q_key}")
+                if total_invalid > 0:
+                    q_key = f"{self.quarantine_prefix}/{silver_subpath}/{partition}batch.parquet"
+                    self._write_single_parquet(invalid_df, q_key)
                     written_quarantine_keys.append(q_key)
-                    logger.warning(
-                        f"Quarantined {file_invalid} invalid records "
-                        f"from {data_key}"
-                    )
+                    logger.warning(f"Quarantined {total_invalid} invalid records from batch")
 
-            silver_meta["status"] = "silver_complete"
-            silver_meta["partition"] = partition
-            silver_meta["source_bronze_keys"] = bronze_meta.get("data_keys", [])
-            silver_meta["record_count"] = total_valid
-            silver_meta["quarantine_count"] = total_invalid
-            silver_meta["data_keys"] = written_silver_keys
-            silver_meta["quarantine_keys"] = written_quarantine_keys
-            silver_meta["created_at"] = datetime.utcnow().isoformat()
-            silver_meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
+                silver_meta["status"] = "silver_complete"
+                silver_meta["partition"] = partition
+                silver_meta["source_bronze_keys"] = bronze_meta.get("data_keys", [])
+                silver_meta["record_count"] = total_valid
+                silver_meta["quarantine_count"] = total_invalid
+                silver_meta["data_keys"] = written_silver_keys
+                silver_meta["quarantine_keys"] = written_quarantine_keys
+                silver_meta["created_at"] = datetime.utcnow().isoformat()
+                silver_meta["processing_duration_seconds"] = round(time.monotonic() - t0, 2)
 
-            self.meta.write_metadata(
-                key=f"{self.metadata_prefix}/watermark/{self.layer}/{silver_subpath}/{partition.replace('/', '_')}.json",
-                metadata_dict=silver_meta,
-            )   
+                self.meta.write_metadata(
+                    key=f"{self.metadata_prefix}/watermark/{self.layer}/{silver_subpath}/{partition.replace('/', '_')}.json",
+                    metadata_dict=silver_meta,
+                )   
 
-            self.meta.mark_loaded(meta_key, bronze_meta, "loaded_to_silver")
+                self.meta.mark_loaded(meta_key, bronze_meta, "loaded_to_silver")
 
-            all_results.append(silver_meta)
+                all_results.append(silver_meta)
 
-        return all_results
+            return all_results
+        except (Py4JNetworkError, ConnectionRefusedError):
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during transformation: {e}")
+            raise
 
     def transform_traffic(self, table_name: str, silver_subpath: str, batch_id: str, lookback_range: int = 720) -> dict:
         return self._transform_generic(

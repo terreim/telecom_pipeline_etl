@@ -93,6 +93,7 @@ from shared.common.s3 import S3IO
 from shared.common.metadata_template import bronze_metadata_template
 from shared.common.config import CFG
 from shared.common.schema import unify_schema, serialize_jsonb_columns
+from shared.common.schema_registry import REGISTRY
 from shared.common.connections import get_postgres_hook, pg_cursor
 from shared.common.metadata import MetadataManager
 from shared.common.watermark import S3WatermarkStore
@@ -369,6 +370,10 @@ class BronzeExtractor:
     ) -> dict:
         total_rows = 0
         acc = DelayAccumulator()
+        try:
+            pg_type_map = REGISTRY.get(table).pg_type_map()
+        except ValueError:
+            pg_type_map = {}
 
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
             tmp_path = tmp_file.name
@@ -391,7 +396,7 @@ class BronzeExtractor:
                 
 
                 if writer is None:
-                    parquet_schema = unify_schema(table_pa.schema)
+                    parquet_schema = unify_schema(table_pa.schema, pg_type_map=pg_type_map)
                     writer = pq.ParquetWriter(tmp_path, parquet_schema, compression="SNAPPY")
 
                 table_pa = table_pa.cast(parquet_schema)
@@ -453,6 +458,11 @@ class BronzeExtractor:
         Records whose *time_column* is NULL or unparseable are placed in
         the *cutoff_time* partition as a fallback.
         """
+        try:
+            pg_type_map = REGISTRY.get(table).pg_type_map()
+        except ValueError:
+            pg_type_map = {}
+
         writers: dict[tuple, dict] = {}   # (y,m,d,h) → {writer, tmp_path, schema, count}
         tmp_paths: list[str] = []
         acc = DelayAccumulator()
@@ -491,7 +501,7 @@ class BronzeExtractor:
                         tmp_path = tmp_file.name
                         tmp_file.close()
                         tmp_paths.append(tmp_path)
-                        parquet_schema = unify_schema(table_pa.schema)
+                        parquet_schema = unify_schema(table_pa.schema, pg_type_map=pg_type_map)
                         writers[key] = {
                             'writer': pq.ParquetWriter(tmp_path, parquet_schema, compression="SNAPPY"),
                             'tmp_path': tmp_path,

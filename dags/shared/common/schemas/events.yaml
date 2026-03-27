@@ -1,0 +1,88 @@
+# ─── Table Identity ───────────────────────────────────────────
+table:
+  source_name: station_events
+  primary_key: event_id
+  time_column: event_time
+  cdc_column: updated_at
+
+# ─── Source Columns ───────────────────────────────────────────
+columns:
+  event_id:
+    category: required
+    pg_type: bigint
+    ch_type: UInt64
+
+  station_id:
+    category: required
+    pg_type: integer
+    ch_type: UInt32
+    validate: { not_null: true }
+
+  event_time:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+    validate: { not_null: true, no_future: true }
+
+  updated_at:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+
+  created_at:
+    category: expected
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+
+  event_type:
+    category: expected
+    pg_type: varchar
+    ch_type: "LowCardinality(String)"
+    validate: { domain: valid_event_types }
+
+  severity:
+    category: expected
+    pg_type: varchar
+    ch_type: "LowCardinality(String)"
+    validate: { domain: valid_severities }
+
+  description:
+    category: passthrough
+    pg_type: text
+    ch_type: "LowCardinality(String)"
+
+  metadata:
+    category: passthrough
+    pg_type: jsonb
+    ch_type: JSON
+
+  target_station_id:
+    category: passthrough
+    pg_type: integer
+    ch_type: UInt32
+
+  is_deleted:
+    category: passthrough
+    pg_type: boolean
+    ch_type: Bool
+
+# ─── Pipeline-Added Columns ──────────────────────────────────
+derived:
+  transformed_at:
+    ch_type: DateTime64(3)
+    expression: "now(UTC)"
+
+enrichment:
+  station_code:     { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_code:    { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_name:    { ch_type: String,                   source: dim_station }
+  province:         { ch_type: "LowCardinality(String)", source: dim_station }
+  district:         { ch_type: String,                   source: dim_station }
+  region:           { ch_type: "LowCardinality(String)", source: dim_station }
+  density_class:    { ch_type: "LowCardinality(String)", source: dim_station }
+  technology:       { ch_type: "LowCardinality(String)", source: dim_station }
+  dim_match_status: { ch_type: "LowCardinality(String)", source: pipeline }
+
+quality:
+  is_valid:        { ch_type: Bool }
+  quality_issues:  { ch_type: String }

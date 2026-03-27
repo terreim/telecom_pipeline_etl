@@ -7,7 +7,6 @@ Gold    → sanity checks   (post-aggregation audit)
 Usage
 -----
     from common.validators import (
-        BRONZE_SCHEMA,
         DEFAULT_PROFILE,
         validate_traffic,
         validate_metrics,
@@ -27,6 +26,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
+
+from shared.common.schema_registry import REGISTRY, SchemaDrift
 
 logger = logging.getLogger(__name__)
 
@@ -107,83 +108,31 @@ VALID_DENSITIES: frozenset[str] = frozenset({
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bronze Schema Validator
+# Bronze Schema Validator (powered by Schema Registry)
 # ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass(frozen=True)
-class BronzeSchema:
-    """Expected columns per table in bronze Parquet files.
-
-    All columns are listed as they come out of the PostgreSQL source.
-    The check is *subset*-based: extra columns are tolerated (e.g. Hive
-    partition columns added by the extractor), but missing ones are flagged.
-    """
-
-    traffic_columns: frozenset[str] = frozenset({
-        "traffic_id", "station_id", "event_time", "imsi_hash",
-        "tmsi", "ip_address", "destination_ip", "destination_port",
-        "protocol", "bytes_up", "bytes_down", "packets_up", "packets_down",
-        "latency_ms", "jitter_ms", "packet_loss_pct", "connection_duration_ms", 
-        "is_deleted", "created_at", "updated_at",
-    })
-
-    metrics_columns: frozenset[str] = frozenset({
-        "metric_id", "station_id", "metric_time",
-        "cpu_usage_pct", "memory_usage_pct", "disk_usage_pct",
-        "temperature_celsius", "power_consumption_watts",
-        "uplink_throughput_mbps", "downlink_throughput_mbps",
-        "active_subscribers", "signal_strength_dbm",
-        "frequency_band", "channel_utilization_pct", 
-        "is_deleted","created_at", "updated_at",
-    })
-
-    events_columns: frozenset[str] = frozenset({
-        "event_id", "station_id", "event_time", "event_type", "severity",
-        "description", "metadata", "target_station_id", 
-        "is_deleted", "created_at", "updated_at",
-    })
-
-    def columns_for(self, table: str) -> frozenset[str]:
-        """Return expected columns for a table name."""
-        mapping = {
-            "subscriber_traffic": self.traffic_columns,
-            "performance_metrics": self.metrics_columns,
-            "station_events": self.events_columns,
-        }
-        result = mapping.get(table)
-        if result is None:
-            raise ValueError(
-                f"Unknown table '{table}'. "
-                f"Expected one of: {', '.join(sorted(mapping))}"
-            )
-        return result
-
-
-BRONZE_SCHEMA = BronzeSchema()
-
 
 def check_bronze_schema(
     df: pd.DataFrame,
     table: str,
-    schema: BronzeSchema = BRONZE_SCHEMA,
-) -> tuple[bool, set[str]]:
-    """Verify a bronze DataFrame has the required columns.
+) -> tuple[bool, SchemaDrift]:
+    """Verify a bronze DataFrame against the schema contract.
+
+    Uses the central Schema Registry instead of hardcoded column sets.
+    Detects drift across three categories:
+      - missing required  → is_breaking (pipeline must stop)
+      - missing expected  → warning (NULL-filled downstream)
+      - new columns       → info (auto-passthrough)
 
     Returns
     -------
-    (is_valid, missing_columns)
-        is_valid is True when all expected columns are present.
-        missing_columns is the set of columns that are absent.
+    (is_valid, drift)
+        is_valid is True when no required columns are missing.
+        drift is a SchemaDrift object with full categorised details.
     """
-    expected = schema.columns_for(table)
-    actual = frozenset(df.columns)
-    missing = expected - actual
-    if missing:
-        logger.warning(
-            "Bronze schema check failed for %s — missing: %s",
-            table, sorted(missing),
-        )
-    return len(missing) == 0, missing
+    contract = REGISTRY.get(table)
+    drift = contract.detect_drift(set(df.columns))
+    drift.log()
+    return not drift.is_breaking, drift
 
 
 # ══════════════════════════════════════════════════════════════════════════════

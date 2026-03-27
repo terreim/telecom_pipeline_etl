@@ -66,7 +66,9 @@ Functions:
         with alarm rate per active hour and correlation to health scores."""
 
 from datetime import date, timedelta
+from typing import Optional
 from shared.common.config import CFG
+from shared.common.schema_registry import REGISTRY
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Dimension template
@@ -130,7 +132,23 @@ def sql_ch_dim_dict() -> str:
 # Bronze layer template
 # ══════════════════════════════════════════════════════════════════════════════
 
-def sql_bronze_extractor(table_name: str, columns: list[str], overlap: int, buffer: int, pk_column: str) -> str:
+def sql_bronze_extractor(
+    table_name: str,
+    columns: Optional[list[str]] = None,
+    overlap: int = CFG.overlap_seconds,
+    buffer: int = CFG.buffer_seconds,
+    pk_column: Optional[str] = None,
+) -> str:
+    """Generate incremental extraction SQL.
+
+    If *columns* or *pk_column* are omitted, they are resolved from the
+    Schema Registry contract for *table_name*.
+    """
+    if columns is None or pk_column is None:
+        contract = REGISTRY.get(table_name)
+        columns = columns or contract.all_source_columns()
+        pk_column = pk_column or contract.primary_key
+
     return f"""
         SELECT {', '.join(columns)}
         FROM {CFG.schema_name}.{table_name}

@@ -1,0 +1,173 @@
+# ─── Table Identity ───────────────────────────────────────────
+table:
+  source_name: subscriber_traffic
+  primary_key: traffic_id
+  time_column: event_time
+  cdc_column: updated_at
+
+# ─── Source Columns ───────────────────────────────────────────
+# category:
+#   required   → pipeline FAILS if missing (PKs, FKs, timestamps)
+#   expected   → validated & used in transforms; NULL-filled if absent
+#   passthrough→ carried along if present, silently skipped if absent
+#
+# validate:
+#   references QualityProfile field names, NOT hardcoded numbers
+#   so DEFAULT_PROFILE vs STRICT_PROFILE still works
+# ──────────────────────────────────────────────────────────────
+
+columns:
+  traffic_id:
+    category: required
+    pg_type: bigint
+    ch_type: UInt64
+
+  station_id:
+    category: required
+    pg_type: integer
+    ch_type: UInt32
+    validate: { not_null: true }
+
+  event_time:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+    validate: { not_null: true, no_future: true }
+
+  updated_at:
+    category: required
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+
+  created_at:
+    category: expected
+    pg_type: timestamp
+    ch_type: DateTime64(3)
+    validate: { ordering: "updated_at >= created_at" }
+
+  imsi_hash:
+    category: expected
+    pg_type: varchar
+    ch_type: String
+    validate: { not_empty: true }
+
+  protocol:
+    category: expected
+    pg_type: varchar
+    ch_type: String
+    validate: { domain: valid_protocols }
+
+  bytes_up:
+    category: expected
+    pg_type: bigint
+    ch_type: UInt64
+    validate: { min: 0 }
+
+  bytes_down:
+    category: expected
+    pg_type: bigint
+    ch_type: UInt64
+    validate: { min: 0 }
+
+  latency_ms:
+    category: expected
+    pg_type: double precision
+    ch_type: Float64
+    validate: { range: latency_range }
+    soft_failure: true
+
+  jitter_ms:
+    category: expected
+    pg_type: double precision
+    ch_type: Float64
+    validate: { range: jitter_range }
+    soft_failure: true
+
+  packet_loss_pct:
+    category: expected
+    pg_type: double precision
+    ch_type: Float64
+    validate: { range: packet_loss_range }
+    soft_failure: true
+
+  connection_duration_ms:
+    category: expected
+    pg_type: integer
+    ch_type: UInt32
+    validate: { range: connection_duration_range }
+    soft_failure: true
+
+  tmsi:
+    category: passthrough
+    pg_type: varchar
+    ch_type: String
+
+  ip_address:
+    category: passthrough
+    pg_type: varchar
+    ch_type: String
+
+  destination_ip:
+    category: passthrough
+    pg_type: varchar
+    ch_type: String
+
+  destination_port:
+    category: passthrough
+    pg_type: integer
+    ch_type: UInt16
+
+  packets_up:
+    category: passthrough
+    pg_type: integer
+    ch_type: UInt32
+
+  packets_down:
+    category: passthrough
+    pg_type: integer
+    ch_type: UInt32
+
+  is_deleted:
+    category: passthrough
+    pg_type: boolean
+    ch_type: Bool
+
+# ─── Pipeline-Added Columns ──────────────────────────────────
+# These are NOT from the source. They're computed by our pipeline.
+# Separated so schema drift detection only watches source columns.
+
+derived:
+  bytes_total:
+    ch_type: UInt64
+    expression: "bytes_up + bytes_down"
+
+  event_date:
+    ch_type: DateTime
+    expression: "event_time.dt.date"
+
+  event_hour:
+    ch_type: DateTime64(3)
+    expression: "event_time.dt.floor('h')"
+
+  is_high_latency:
+    ch_type: Bool
+    expression: "latency_ms > 100"
+
+  transformed_at:
+    ch_type: DateTime64(3)
+    expression: "now(UTC)"
+
+enrichment:
+  station_code:    { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_code:   { ch_type: "LowCardinality(String)", source: dim_station }
+  operator_name:   { ch_type: String,                   source: dim_station }
+  province:        { ch_type: "LowCardinality(String)", source: dim_station }
+  district:        { ch_type: String,                   source: dim_station }
+  region:          { ch_type: "LowCardinality(String)", source: dim_station }
+  density_class:   { ch_type: "LowCardinality(String)", source: dim_station }
+  technology:      { ch_type: "LowCardinality(String)", source: dim_station }
+  dim_match_status: { ch_type: "LowCardinality(String)", source: pipeline }
+
+quality:
+  is_valid:        { ch_type: Bool }
+  quality_issues:  { ch_type: String }

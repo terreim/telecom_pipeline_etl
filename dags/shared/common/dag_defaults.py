@@ -9,7 +9,8 @@ _BASE = {
 }
 
 BRONZE_DEFAULTS = {**_BASE, "execution_timeout": timedelta(minutes=10), "sla": timedelta(hours=1)}
-SILVER_DEFAULTS = {**_BASE, "execution_timeout": timedelta(minutes=30), "retries": 3}
-GOLD_DEFAULTS   = {**_BASE, "execution_timeout": timedelta(hours=1), "retries": 5}
+SILVER_DEFAULTS = {**_BASE, "execution_timeout": timedelta(minutes=30), "retries": 5}
+SPARK_SILVER_DEFAULTS = {**_BASE, "retry_delay": timedelta(seconds=10), "retry_exponential_backoff": False, "execution_timeout": timedelta(minutes=45), "retries": 5} 
+GOLD_DEFAULTS   = {**_BASE, "execution_timeout": timedelta(hours=1), "retries": 2}
 STAGING_DEFAULTS = {**_BASE, "execution_timeout": timedelta(minutes=30), "retries": 3}
 RECOVERY_DEFAULTS = {**_BASE, "retries": 1}
