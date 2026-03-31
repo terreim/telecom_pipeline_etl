@@ -32,3 +32,5 @@ RUN pip install --no-cache-dir \
     airflow-clickhouse-plugin==1.6.0 \
     clickhouse-driver==0.2.10 \
     pyspark==4.0.2
+
+COPY dags/ /opt/airflow/dags/

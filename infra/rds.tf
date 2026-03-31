@@ -16,7 +16,7 @@ resource "aws_db_instance" "telecom_oltp" {
     engine_version = "17"
     instance_class = "db.t3.micro"
     allocated_storage = 20
-    db_name = "${var.project}"
+    db_name = "airflow"
     username = "postgres"
     password = var.db_password
     db_subnet_group_name = aws_db_subnet_group.telecom_db.name
