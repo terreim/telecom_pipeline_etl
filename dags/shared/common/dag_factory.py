@@ -13,7 +13,6 @@ from airflow.utils.trigger_rule import TriggerRule
 from shared.common.config import CFG
 from shared.util.bronze_extractor import BronzeExtractor
 from shared.util.silver_transformer import SilverTransformer
-from shared.util.spark_silver_transformer import SparkSilverTransformer
 from shared.util.staging_loader import ClickHouseLoader
 from shared.util.gold_aggregator import GoldAggregator
 
@@ -176,6 +175,7 @@ class SparkSilverDag(DagFactory):
 
         @task(outlets=outlets or [], task_id=f"spark_transform_{bronze_table}", pool=pool)
         def transform(**context):
+            from shared.util.spark_silver_transformer import SparkSilverTransformer
             transformer = SparkSilverTransformer(postgres_conn_id=pg_conn_id)
             fn = getattr(transformer, transform_method)
             return fn(

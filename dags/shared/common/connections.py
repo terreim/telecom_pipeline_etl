@@ -39,7 +39,7 @@ def get_s3_credentials(conn_id: str) -> tuple[str, str, str]:
     s3_secret_key = creds.secret_key
 
     conn = s3_hook.get_connection(conn_id=conn_id)
-    s3_endpoint = conn.extra_dejson.get("endpoint_url", "http://minio:9000")
+    s3_endpoint = conn.extra_dejson.get("endpoint_url", "https://s3.ap-southeast-2.amazonaws.com")
 
     return (s3_access_key, s3_secret_key, s3_endpoint)
 

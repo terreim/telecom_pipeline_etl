@@ -22,7 +22,6 @@ FROM apache/airflow:3.1.3
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    default-jdk-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -30,7 +29,9 @@ USER airflow
 RUN pip install --no-cache-dir \
     apache-airflow-providers-amazon==9.19.0 \
     airflow-clickhouse-plugin==1.6.0 \
-    clickhouse-driver==0.2.10 \
-    pyspark==4.0.2
+    clickhouse-driver==0.2.10
 
-COPY dags/ /opt/airflow/dags/
+RUN mkdir -p /opt/airflow/etl_temp
+
+COPY ./dags/ /opt/airflow/dags/
+COPY ./telecom_simulator_v5.py /opt/airflow/telecom_simulator_v5.py
