@@ -2,7 +2,9 @@
 # VPC
 # ──────────────────────────────────────
 resource "aws_vpc" "main" {
-  cidr_block = var.vpc_cidr
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = {
     Name = "${var.project}-vpc"
@@ -115,5 +117,53 @@ resource "aws_vpc_endpoint" "s3" {
 
   tags = {
     Name = "${var.project}-s3-endpoint"
+  }
+}
+
+# ──────────────────────────────────────
+# VPC Endpoints (Interface type)
+# ──────────────────────────────────────
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.ecr.api"
+  vpc_endpoint_type = "Interface"
+
+  subnet_ids        = [aws_subnet.private_1.id, aws_subnet.private_2.id]
+  security_group_ids = [aws_security_group.private.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project}-ecr-api-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.ecr.dkr"
+  vpc_endpoint_type = "Interface"
+
+  subnet_ids        = [aws_subnet.private_1.id, aws_subnet.private_2.id]
+  security_group_ids = [aws_security_group.private.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project}-ecr-dkr-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.logs"
+  vpc_endpoint_type = "Interface"
+
+  subnet_ids        = [aws_subnet.private_1.id, aws_subnet.private_2.id]
+  security_group_ids = [aws_security_group.private.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project}-logs-endpoint"
   }
 }

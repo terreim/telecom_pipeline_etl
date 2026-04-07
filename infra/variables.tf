@@ -26,3 +26,21 @@ variable "bucket" {
     description = "S3 bucket name for the Telecom pipeline (must be globally unique)"
     type        = string
 }
+
+variable "jwt_secret" {
+    description = "Shared JWT secret for Airflow internal API auth"
+    type        = string
+    sensitive   = true
+}
+
+variable "aws_access_key" {
+    description = "AWS access key for Airflow S3 connection"
+    type        = string
+    sensitive   = true
+}
+
+variable "aws_secret_key" {
+    description = "AWS secret key for Airflow S3 connection"
+    type        = string
+    sensitive   = true
+}

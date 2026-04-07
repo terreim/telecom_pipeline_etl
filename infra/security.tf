@@ -36,6 +36,12 @@ resource "aws_vpc_security_group_ingress_rule" "allow_ssh_1_ipv4" {
   cidr_ipv4         = "27.72.57.173/32"
 }
 
+resource "aws_vpc_security_group_ingress_rule" "allow_public_to_public" {
+  security_group_id            = aws_security_group.public.id
+  ip_protocol                  = "-1"
+  referenced_security_group_id = aws_security_group.public.id
+}
+
 # Direct from EC2 Instance Connect.
 resource "aws_vpc_security_group_ingress_rule" "allow_ssh_2_ipv4" {
   security_group_id = aws_security_group.public.id

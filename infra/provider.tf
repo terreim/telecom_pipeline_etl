@@ -9,7 +9,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket = "telecom-tfstate-duylt10"
+    bucket = "telecom-tfstate-yournamehere" # Or your own unique bucket name
     key    = "infra/terraform.tfstate"
     region = "ap-southeast-2"
   }
